@@ -1,5 +1,7 @@
 # macOS
 .DS_Store
+__pycache__/
+*.py[cod]
 
 # local binary cache
 dql/bin/.cache/

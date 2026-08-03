@@ -1,0 +1,61 @@
+{
+  "skill_name": "rum-instrument",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "使用 $rum-instrument 规划这个已有异步 CDN RUM 接入的 Vue Web 仓库。\n\ndatawayUrl: {{DATAWAY_URL}}\ntemporaryAuthCode: env:GUANCE_TEMP_AUTH_CODE\nappId: {{APP_ID}}\napplicationType: web",
+      "expected_output": "生成 plan-only 的完整仓库审计和 revision 计划；通过官方站点目录与 AI API 安全解析应用，识别既有初始化与重复/漂移风险，不修改业务代码，不输出任何凭证值。",
+      "files": [],
+      "expectations": [
+        "将输入字段归一化为 Public DataWay 接收模式、临时授权码来源和运行时 Client Token 引用",
+        "AI API Endpoint 来自匹配的 Guance/TrueWatch 站点目录而非 Owl 或主机名改写",
+        "用户 applicationType 优先于 AI API 和仓库自动识别",
+        "识别并收敛已有 RUM，而不是增加第二个初始化器",
+        "计划包含隐私、Trace、Replay、Sourcemap 和本地验证决策",
+        "计划保持 pending，明确等待 revision 审批",
+        "输出和计划中不包含临时授权码、API Key 或 Client Token 值"
+      ]
+    },
+    {
+      "id": 2,
+      "prompt": "使用 $rum-instrument 规划 Flutter Android、iOS 和 Web 的观测云 RUM 接入。\n\ndatawayUrl: {{DATAWAY_URL}}\ntemporaryAuthCode: env:GUANCE_TEMP_AUTH_CODE\nappId:\n  android: {{ANDROID_APP_ID}}\n  ios: {{IOS_APP_ID}}\n  web: {{WEB_APP_ID}}\napplicationType:\n  android: android\n  ios: ios\n  web: web",
+      "expected_output": "把 Flutter mobile 与 Flutter Web 路由到正确适配器，保留三个独立 Application ID，只输出待审批计划。",
+      "files": [],
+      "expectations": [
+        "Android、iOS 和 Web 使用三个独立 Application ID 槽位",
+        "Flutter Web 使用 Browser RUM 且不修改 build/web",
+        "移动端与原生 SDK 初始化不会重复",
+        "Session Replay 默认关闭或明确要求隐私审批",
+        "Sourcemap、dSYM 和 Android mapping 仅规划不上传"
+      ]
+    },
+    {
+      "id": 3,
+      "prompt": "使用 $rum-instrument 规划当前 monorepo 的观测云 RUM 接入。\n\ndatakitUrl: {{DATAKIT_URL}}\nappId: {{APP_ID}}",
+      "expected_output": "自动识别所有部署目标；当 scalar appId 无法唯一映射到多个独立应用时不把它分配给任一目标，完成其余分析并阻塞所有未解析的 ID 槽位。",
+      "files": [],
+      "expectations": [
+        "从 datakitUrl 自动识别 DataKit 接收模式且不触发控制面或 Client Token 流程",
+        "记录 appId 的 scalar 输入形态，不会将它复制或任意分配给多个未解析目标中的任意一个",
+        "所有未解析的独立应用均标记 blocked，并只请求对应的目标级 Application ID",
+        "仍然完成仓库、平台、现有接入和验证分析",
+        "只询问无法映射的 Application ID，不要求用户提供完整 Profile",
+        "不修改应用代码并输出 pending revision"
+      ]
+    },
+    {
+      "id": 4,
+      "prompt": "使用 $rum-instrument 规划当前 Vue Web 仓库在隔离测试环境的观测云 RUM 接入。测试 DataWay 不在官方站点目录中，已提供一个本地 JSON 测试目录文件；测试 AI API 使用 HTTPS，但当前机器不信任其证书链，允许仅本次测试跳过证书验证。\n\ndatawayUrl: http://testing-openway.dataflux.cn\ntemporaryAuthCode: env:GUANCE_TEMP_AUTH_CODE\nappId: testing_web_manage",
+      "expected_output": "标准 Prompt 保持最小输入；执行层显式使用测试目录和测试 TLS 开关，准确解析应用类型与 Client Token 引用，并在计划中隔离所有测试例外。",
+      "files": [],
+      "expectations": [
+        "标准 Prompt 不新增 clientToken 或 aiApiEndpoint 字段",
+        "仅通过 --test-site-catalog-file 启用自定义目录，并对 DataWay 做精确匹配",
+        "AI API 仍要求 HTTPS，--insecure-test-tls 只能与测试目录一起使用",
+        "计划记录 catalog=testing_override、test_only=true、目录来源和 TLS 验证状态",
+        "输出中不包含临时授权码、API Key 或 Client Token 值",
+        "明确禁止把测试目录、TLS 例外或 HTTP DataWay 推广到生产"
+      ]
+    }
+  ]
+}
