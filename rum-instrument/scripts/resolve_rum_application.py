@@ -24,6 +24,9 @@ CATALOGS = (
     ("guance", "https://urls.guance.com/"),
     ("truewatch", "https://urls.truewatch.com/"),
 )
+TESTING_DATAWAY_URL = "http://testing-openway.dataflux.cn"
+TESTING_AI_API_URL = "https://testing-ft2x-ai-api.dataflux.cn"
+TESTING_CATALOG = "builtin_testing"
 DEFAULT_RUM_OPENWAY_ALIASES = {
     "https://rum-openway.guance.com": ("guance", "default"),
 }
@@ -39,6 +42,7 @@ APPLICATION_TYPES = {
 CLIENT_TOKEN_PATTERN = re.compile(r"^[A-Za-z0-9._~+/=-]+$")
 ENV_NAME_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 SLOT_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+SHA256_PATTERN = re.compile(r"^sha256:[0-9a-f]{64}$")
 EXCHANGE_PATH = "/api/v1/account/accesskey/exchange"
 RUM_APP_GET_PATH = "/api/v1/rum/app/get"
 DEFAULT_TEMP_CODE_ENV = "GUANCE_TEMP_AUTH_CODE"
@@ -47,6 +51,10 @@ DEFAULT_CLIENT_TOKEN_ENV = "GUANCE_RUM_CLIENT_TOKEN"
 
 class ResolutionError(RuntimeError):
     """A safe-to-display resolution error that never contains response bodies."""
+
+
+class TransientResolutionError(ResolutionError):
+    """A retryable transport failure for an idempotent application lookup."""
 
 
 @dataclass(frozen=True)
@@ -100,9 +108,16 @@ def _read_json_response(
         with urlopen(request, timeout=timeout, context=tls_context) as response:
             payload = json.load(response)
     except HTTPError as error:
-        raise ResolutionError(f"{operation} failed with HTTP {error.code}") from None
+        error_type = (
+            TransientResolutionError
+            if error.code in {408, 429, 500, 502, 503, 504}
+            else ResolutionError
+        )
+        raise error_type(f"{operation} failed with HTTP {error.code}") from None
     except (URLError, TimeoutError, OSError, UnicodeError, json.JSONDecodeError):
-        raise ResolutionError(f"{operation} failed before a valid JSON response was received") from None
+        raise TransientResolutionError(
+            f"{operation} failed before a valid JSON response was received"
+        ) from None
     if not isinstance(payload, dict):
         raise ResolutionError(f"{operation} returned an invalid JSON object")
     return payload
@@ -164,6 +179,16 @@ def resolve_site(
     tls_verification: str = "verified",
 ) -> Site:
     requested_origin = normalize_origin(dataway_url, "datawayUrl")
+    if requested_origin == TESTING_DATAWAY_URL:
+        return Site(
+            brand="guance",
+            code="testing",
+            catalog_url=TESTING_CATALOG,
+            dataway_url=TESTING_DATAWAY_URL,
+            ai_api_url=TESTING_AI_API_URL,
+            catalog_kind="testing",
+            tls_verification=tls_verification,
+        )
     loaded: dict[tuple[str, str], tuple[str, dict[str, Any]]] = {}
     unavailable_catalogs: list[str] = []
 
@@ -259,51 +284,56 @@ def _site_from_entry(
     )
 
 
-def load_test_site_catalog(path: Path) -> tuple[Path, dict[str, Any]]:
-    resolved = path.expanduser().resolve()
-    try:
-        payload = json.loads(resolved.read_text(encoding="utf-8"))
-    except OSError:
-        raise ResolutionError("the test site catalog file could not be read") from None
-    except (UnicodeError, json.JSONDecodeError):
-        raise ResolutionError("the test site catalog file is not valid UTF-8 JSON") from None
-    if not isinstance(payload, dict):
-        raise ResolutionError("the test site catalog must contain a JSON object")
-    _catalog_entries(payload, f"test-file:{resolved}")
-    return resolved, payload
-
-
-def resolve_test_site(
-    dataway_url: str,
-    catalog_file: Path,
-    *,
-    insecure_test_tls: bool = False,
-) -> Site:
-    resolved, payload = load_test_site_catalog(catalog_file)
-    catalog_reference = f"test-file:{resolved}"
-    return resolve_site(
-        dataway_url,
-        catalog_fetcher=lambda _: payload,
-        catalogs=(("testing", catalog_reference),),
-        catalog_kind="testing_override",
-        tls_verification=(
-            "disabled_for_testing" if insecure_test_tls else "verified"
-        ),
-    )
-
-
 def build_ai_api_tls_context(
     *,
     insecure_test_tls: bool,
-    testing_override: bool,
+    testing_site: bool,
 ) -> ssl.SSLContext | None:
-    if insecure_test_tls and not testing_override:
+    if insecure_test_tls and not testing_site:
         raise ResolutionError(
-            "--insecure-test-tls requires --test-site-catalog-file"
+            "--insecure-test-tls is allowed only for the built-in testing site"
         )
     if insecure_test_tls:
         return ssl._create_unverified_context()
     return None
+
+
+def probe_http_origin(
+    origin: str,
+    *,
+    timeout: float = 10.0,
+    tls_context: ssl.SSLContext | None = None,
+) -> dict[str, Any]:
+    request = Request(
+        f"{origin}/",
+        headers={"User-Agent": "rum-instrument/1"},
+        method="HEAD",
+    )
+    try:
+        with urlopen(request, timeout=timeout, context=tls_context) as response:
+            status = response.status
+    except HTTPError as error:
+        status = error.code
+    except (URLError, TimeoutError, OSError):
+        raise ResolutionError(
+            f"credential-free network preflight failed for {origin}"
+        ) from None
+    return {"status": "reachable", "http_status": status}
+
+
+def preflight_site(
+    site: Site,
+    *,
+    ai_api_tls_context: ssl.SSLContext | None = None,
+) -> dict[str, Any]:
+    return {
+        "status": "passed",
+        "dataway": probe_http_origin(site.dataway_url),
+        "ai_api": probe_http_origin(
+            site.ai_api_url,
+            tls_context=ai_api_tls_context,
+        ),
+    }
 
 
 def _response_item(payload: dict[str, Any], operation: str) -> dict[str, Any]:
@@ -348,7 +378,7 @@ def resolve_applications(
     *,
     user_application_types: dict[str, str] | None = None,
     json_poster: JsonPoster = post_json,
-    lookup_attempts: int = 3,
+    network_attempts: int = 3,
     retry_delay: float = 1.0,
     sleeper: Sleeper = time.sleep,
 ) -> tuple[dict[str, Any], dict[str, str]]:
@@ -365,8 +395,8 @@ def resolve_applications(
     if not isinstance(temporary_authorization_code, str) or not temporary_authorization_code.strip():
         raise ResolutionError("the temporary authorization code input is empty")
     temporary_authorization_code = temporary_authorization_code.strip()
-    if lookup_attempts < 1:
-        raise ResolutionError("lookup_attempts must be at least 1")
+    if network_attempts < 1:
+        raise ResolutionError("network_attempts must be at least 1")
     selected_user_types = user_application_types or {}
     if set(selected_user_types) - set(application_ids):
         raise ResolutionError("applicationType contains a slot that has no matching appId")
@@ -392,57 +422,41 @@ def resolve_applications(
         app_url = f"{site.ai_api_url}{RUM_APP_GET_PATH}"
         operation = f"RUM application lookup for slot {slot}"
         app_item: dict[str, Any] | None = None
-        for attempt in range(lookup_attempts):
-            app_payload = json_poster(
-                app_url,
-                {"app_id": app_id.strip()},
-                {"DF-API-KEY": api_key},
-                operation,
-            )
+        attempts_used = 0
+        for attempt in range(network_attempts):
+            attempts_used = attempt + 1
+            try:
+                app_payload = json_poster(
+                    app_url,
+                    {"app_id": app_id.strip()},
+                    {"DF-API-KEY": api_key},
+                    operation,
+                )
+            except TransientResolutionError:
+                if attempt + 1 >= network_attempts:
+                    raise ResolutionError(
+                        f"{operation} failed after {network_attempts} network attempts"
+                    ) from None
+                sleeper(retry_delay)
+                continue
             candidate = _response_item(app_payload, operation)
             returned_app_id = candidate.get("app_id")
             if returned_app_id is not None and returned_app_id != app_id.strip():
                 raise ResolutionError(f"{operation} returned a different app_id")
 
             token_expired = candidate.get("token_expired")
-            sync_status = candidate.get("client_token_sync_status")
-            mapping_status = candidate.get("mapping_status")
-            mapping_ready = candidate.get("mapping_ready")
             if token_expired is not False:
                 raise ResolutionError(f"{operation} returned an expired or unverifiable Client Token")
-            if sync_status in {"failed", "not_applicable"}:
-                raise ResolutionError(f"{operation} reported Client Token synchronization failure")
-            if mapping_status == "failed":
-                raise ResolutionError(f"{operation} reported application mapping failure")
-            if (
-                sync_status == "accepted"
-                and mapping_status == "ready"
-                and mapping_ready is True
-            ):
-                app_item = candidate
-                break
-            if (
-                sync_status not in {"accepted", "queued"}
-                or mapping_status not in {"pending", "ready"}
-                or not isinstance(mapping_ready, bool)
-            ):
-                raise ResolutionError(f"{operation} returned unsupported readiness metadata")
-            if attempt + 1 < lookup_attempts:
-                sleeper(retry_delay)
+            app_item = candidate
+            break
 
         if app_item is None:
-            raise ResolutionError(
-                f"{operation} did not become ready after {lookup_attempts} attempts"
-            )
+            raise ResolutionError(f"{operation} did not return an application")
         client_token = app_item.get("client_token")
         api_application_type = app_item.get("app_type")
-        if (
-            not isinstance(client_token, str)
-            or not client_token
-            or not CLIENT_TOKEN_PATTERN.fullmatch(client_token)
-        ):
+        if not isinstance(client_token, str) or not client_token:
             raise ResolutionError(
-                f"{operation} did not return a usable data.item.client_token"
+                f"{operation} did not return data.item.client_token"
             )
         if api_application_type not in APPLICATION_TYPES:
             raise ResolutionError(
@@ -457,9 +471,17 @@ def resolve_applications(
             "selected_app_type_source": "user" if user_type else "ai_api",
             "type_mismatch": bool(user_type and user_type != api_application_type),
             "token_expired": False,
-            "client_token_sync_status": app_item["client_token_sync_status"],
-            "mapping_status": app_item["mapping_status"],
-            "mapping_ready": True,
+            "client_token_available": True,
+            "network_attempts": attempts_used,
+            "observations": {
+                field: app_item[field]
+                for field in (
+                    "client_token_sync_status",
+                    "mapping_status",
+                    "mapping_ready",
+                )
+                if field in app_item
+            },
         }
         client_tokens[slot] = client_token
 
@@ -584,10 +606,14 @@ def write_client_tokens_env(
 def build_safe_result(
     metadata: dict[str, Any],
     *,
+    plan_digest: str,
     client_token_environments: dict[str, str],
     secret_file: Path | None,
 ) -> dict[str, Any]:
     return {
+        "schema_version": 1,
+        "kind": "rum_control_plane_state",
+        "plan_digest": plan_digest,
         **metadata,
         "client_tokens": {
             slot: {
@@ -678,10 +704,12 @@ def site_metadata(site: Site) -> dict[str, Any]:
     }
 
 
-def write_metadata_file(path: Path, rendered: str) -> Path:
+def write_state_file(path: Path, rendered: str) -> Path:
     candidate = path.expanduser()
     if candidate.exists() or candidate.is_symlink():
-        raise ResolutionError("metadata file already exists; refusing to overwrite it")
+        raise ResolutionError(
+            "control-plane state file already exists; refusing to overwrite it"
+        )
     output = candidate.resolve()
     created = False
     try:
@@ -693,7 +721,7 @@ def write_metadata_file(path: Path, rendered: str) -> Path:
     except OSError:
         if created:
             output.unlink(missing_ok=True)
-        raise ResolutionError("metadata file could not be created safely") from None
+        raise ResolutionError("control-plane state file could not be created safely") from None
     return output
 
 
@@ -732,21 +760,26 @@ def main() -> int:
     )
     parser.add_argument("--client-token-env-file", type=Path)
     parser.add_argument("--repository", type=Path)
-    parser.add_argument("--metadata-file", type=Path)
+    parser.add_argument(
+        "--state-file",
+        "--metadata-file",
+        dest="state_file",
+        type=Path,
+        help="write non-secret control-plane execution state",
+    )
+    parser.add_argument(
+        "--plan-digest",
+        help="canonical plan digest emitted by validate_contract.py --print-review-digest",
+    )
     parser.add_argument(
         "--allow-external-secret-sink",
         action="store_true",
         help="allow an explicitly reviewed secret sink outside the repository",
     )
     parser.add_argument(
-        "--test-site-catalog-file",
-        type=Path,
-        help="explicit test-only catalog override; disables official catalog lookup for this run",
-    )
-    parser.add_argument(
         "--insecure-test-tls",
         action="store_true",
-        help="test only: disable AI API certificate verification; requires a test catalog file",
+        help="test only: disable AI API certificate verification for the built-in testing site",
     )
     arguments = parser.parse_args()
 
@@ -765,11 +798,13 @@ def main() -> int:
                 or arguments.client_token_env
                 or arguments.client_token_env_file
                 or arguments.repository
+                or arguments.state_file
+                or arguments.plan_digest
                 or arguments.allow_external_secret_sink
             )
             if incompatible:
                 raise ResolutionError(
-                    "--site-only accepts only site resolution and optional metadata output"
+                    "--site-only accepts only site resolution"
                 )
         elif not application_ids:
             raise ResolutionError("at least one --app-id is required unless --site-only is used")
@@ -777,9 +812,15 @@ def main() -> int:
             raise ResolutionError(
                 "application lookup requires --client-token-env-file so the Client Token is not discarded"
             )
-        elif arguments.metadata_file is None:
+        elif arguments.state_file is None:
             raise ResolutionError(
-                "application lookup requires --metadata-file for recoverable non-secret results"
+                "application lookup requires --state-file for recoverable non-secret results"
+            )
+        elif not isinstance(arguments.plan_digest, str) or not SHA256_PATTERN.fullmatch(
+            arguments.plan_digest
+        ):
+            raise ResolutionError(
+                "application lookup requires --plan-digest as sha256:<64 lowercase hex>"
             )
         client_token_environments = (
             parse_slot_assignments(arguments.client_token_env, "client-token environment")
@@ -802,17 +843,19 @@ def main() -> int:
                 raise ResolutionError(
                     "--client-token-env-file requires --repository for Git ignore verification"
                 )
-        if arguments.metadata_file is not None:
-            metadata_candidate = arguments.metadata_file.expanduser()
-            if metadata_candidate.exists() or metadata_candidate.is_symlink():
-                raise ResolutionError("metadata file already exists; refusing to overwrite it")
+        if arguments.state_file is not None:
+            state_candidate = arguments.state_file.expanduser()
+            if state_candidate.exists() or state_candidate.is_symlink():
+                raise ResolutionError(
+                    "control-plane state file already exists; refusing to overwrite it"
+                )
             if (
                 arguments.client_token_env_file is not None
-                and metadata_candidate.resolve()
+                and state_candidate.resolve()
                 == arguments.client_token_env_file.expanduser().resolve()
             ):
                 raise ResolutionError(
-                    "metadata file and client-token env file must use different paths"
+                    "control-plane state and client-token env files must use different paths"
                 )
         if arguments.client_token_env_file is not None:
             repository_root = arguments.repository.expanduser().resolve()
@@ -829,20 +872,24 @@ def main() -> int:
                 arguments.client_token_env_file.expanduser().resolve(),
                 arguments.repository,
             )
-        testing_override = arguments.test_site_catalog_file is not None
+        if arguments.state_file is not None:
+            _require_git_ignored(
+                arguments.state_file.expanduser().resolve(),
+                arguments.repository,
+            )
+        site = resolve_site(arguments.dataway_url)
+        testing_site = site.catalog_url == TESTING_CATALOG
         tls_context = build_ai_api_tls_context(
             insecure_test_tls=arguments.insecure_test_tls,
-            testing_override=testing_override,
+            testing_site=testing_site,
         )
-        site = (
-            resolve_test_site(
-                arguments.dataway_url,
-                arguments.test_site_catalog_file,
-                insecure_test_tls=arguments.insecure_test_tls,
+        if arguments.insecure_test_tls:
+            site = Site(
+                **{
+                    **site.__dict__,
+                    "tls_verification": "disabled_for_testing",
+                }
             )
-            if arguments.test_site_catalog_file is not None
-            else resolve_site(arguments.dataway_url)
-        )
         if arguments.site_only:
             rendered = json.dumps(
                 site_metadata(site),
@@ -850,10 +897,12 @@ def main() -> int:
                 indent=2,
                 sort_keys=True,
             )
-            if arguments.metadata_file is not None:
-                write_metadata_file(arguments.metadata_file, rendered)
             print(rendered)
             return 0
+        network_preflight = preflight_site(
+            site,
+            ai_api_tls_context=tls_context,
+        )
         temporary_code = read_temporary_authorization_code(
             environment_name=arguments.temporary_auth_code_env,
             from_stdin=arguments.temporary_auth_code_stdin,
@@ -880,9 +929,11 @@ def main() -> int:
             user_application_types=application_types,
             json_poster=selected_json_poster,
         )
+        metadata["network_preflight"] = network_preflight
         intended_secret_file = arguments.client_token_env_file.expanduser().resolve()
         result = build_safe_result(
             metadata,
+            plan_digest=arguments.plan_digest,
             client_token_environments=client_token_environments,
             secret_file=intended_secret_file,
         )
@@ -894,16 +945,16 @@ def main() -> int:
             repository=arguments.repository,
         )
         try:
-            write_metadata_file(arguments.metadata_file, rendered)
-        except ResolutionError as metadata_error:
+            write_state_file(arguments.state_file, rendered)
+        except ResolutionError as state_error:
             try:
                 secret_file.unlink(missing_ok=True)
             except OSError:
                 raise ResolutionError(
-                    "metadata persistence failed and the new client-token sink "
+                    "control-plane state persistence failed and the new client-token sink "
                     "could not be rolled back; remove that sink before retrying"
                 ) from None
-            raise metadata_error
+            raise state_error
         print(rendered)
         return 0
     except ResolutionError as error:

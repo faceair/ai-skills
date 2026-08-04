@@ -17,18 +17,22 @@ For Public DataWay, also validate:
 - normalized origin matches `openway` in an official Guance/TrueWatch catalog or the documented default Web RUM alias;
 - `ai_api` comes from the matched catalog entry rather than hostname rewriting;
 - the exchange and application lookup paths are exact;
-- stdout, metadata, plans, diffs, and Git status contain no temporary code, API Key, or Client Token value;
+- stdout, execution state, plans, diffs, and Git status contain no temporary code, API Key, or Client Token value;
 - an in-repository restricted environment-assignment file is ignored and mode `0600`.
-- the application lookup used both a new restricted configuration sink and a distinct new metadata file; a simulated metadata-write failure leaves no orphan Client Token sink;
-- before application-code edits, `control_plane.status` is `resolved`, every selected application type records `matched`/`mismatched` plus `api_value`, and the resolved plan passes implementation validation.
+- the helper verifies both receiver origins without credentials before reading the temporary code;
+- the application lookup used both a new restricted configuration sink and a distinct Git-ignored state file; a simulated state-write failure leaves no orphan Client Token sink;
+- one code exchange and one successful lookup occur per Application ID; only transient lookup transport failures are retried;
+- Token acceptance checks only `token_expired: false` plus a present non-empty `client_token`; sync/mapping observations do not trigger polling or block implementation;
+- before application-code edits, the stable plan and matching digest-bound execution state pass implementation validation.
 
-For an approved test-site override, additionally validate:
+For the approved built-in testing site, additionally validate:
 
-- the helper was given `--test-site-catalog-file`, the DataWay origin matched that file exactly, and official catalogs were not used as fallback;
-- the plan records `catalog: testing_override`, an `env:` or `existing:` catalog source, and `test_only: true`;
-- the AI API remains HTTPS;
-- `--insecure-test-tls` was explicitly approved and cannot run without the test catalog;
-- the test catalog, TLS exception, and any HTTP DataWay receiver are excluded from production configuration.
+- the DataWay is exactly `http://testing-openway.dataflux.cn`;
+- the only AI API is `https://testing-ft2x-ai-api.dataflux.cn`;
+- the plan records `catalog: builtin_testing`, `site_code: testing`, and `test_only: true`;
+- neither runtime instructions nor state load operational configuration from `evals/`;
+- `--insecure-test-tls` was explicitly approved and cannot run for an official site;
+- the built-in testing site, TLS exception, and HTTP DataWay receiver are excluded from production configuration.
 
 For DataKit, assert that no control-plane lookup, temporary code, API Key, or Client Token is present. Require evidence that the RUM collector is enabled/configured and that the target runtime can reach the exact DataKit origin; unknown or blocked readiness prevents implementation.
 

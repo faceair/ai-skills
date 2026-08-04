@@ -138,6 +138,61 @@ def resolve_public_dataway(plan):
             descriptor["verification"] = "matched"
 
 
+def valid_control_plane_state(plan):
+    return {
+        "schema_version": 1,
+        "kind": "rum_control_plane_state",
+        "plan_digest": VALIDATOR.plan_review_digest(plan),
+        "site": {
+            "brand": "guance",
+            "code": plan["request"]["receiver"]["control_plane"]["site_code"],
+            "catalog": plan["request"]["receiver"]["control_plane"]["catalog"],
+            "dataway_url": "https://cn3-openway.guance.com",
+            "ai_api": plan["request"]["receiver"]["control_plane"][
+                "ai_api_endpoint"
+            ]["value"],
+            "tls_verification": "verified",
+        },
+        "network_preflight": {
+            "status": "passed",
+            "dataway": {"status": "reachable", "http_status": 404},
+            "ai_api": {"status": "reachable", "http_status": 401},
+        },
+        "credential_resolution": {
+            "status": "resolved",
+            "exchange_path": "/api/v1/account/accesskey/exchange",
+            "application_lookup_path": "/api/v1/rum/app/get",
+            "api_key_persistence": "memory_only",
+        },
+        "applications": {
+            "web": {
+                "app_id": "web_demo",
+                "api_app_type": "web",
+                "selected_app_type": "web",
+                "selected_app_type_source": "ai_api",
+                "type_mismatch": False,
+                "token_expired": False,
+                "client_token_available": True,
+                "network_attempts": 1,
+                "observations": {
+                    "mapping_status": "pending",
+                    "mapping_ready": False,
+                },
+            }
+        },
+        "client_tokens": {
+            "web": {
+                "source": "runtime:GUANCE_RUM_CLIENT_TOKEN",
+                "availability": "persisted",
+            }
+        },
+        "secret_sink": {
+            "path": "/tmp/rum-client-token.env",
+            "format": "dotenv",
+        },
+    }
+
+
 def verified_datakit_readiness():
     return {
         "status": "verified",
@@ -248,15 +303,12 @@ class ValidateContractTests(unittest.TestCase):
             )
         )
 
-    def test_accepts_explicit_test_catalog_and_tls_exception(self):
+    def test_accepts_built_in_testing_site_and_tls_exception(self):
         plan = valid_plan()
         control_plane = plan["request"]["receiver"]["control_plane"]
         control_plane.update(
             {
-                "catalog": "testing_override",
-                "catalog_source": {
-                    "source": "existing:evals/files/test-site-catalog.json#testing"
-                },
+                "catalog": "builtin_testing",
                 "site_code": "testing",
                 "ai_api_endpoint": {
                     "value": "https://testing-ft2x-ai-api.dataflux.cn"
@@ -283,36 +335,43 @@ class ValidateContractTests(unittest.TestCase):
             any("must remain verified for official catalogs" in error for error in errors)
         )
 
-    def test_test_catalog_requires_explicit_test_only_source(self):
-        plan = valid_plan()
-        control_plane = plan["request"]["receiver"]["control_plane"]
-        control_plane["catalog"] = "testing_override"
-
-        errors, _ = VALIDATOR.validate_plan(plan, "plan")
-
-        self.assertTrue(any(".test_only must be true" in error for error in errors))
-        self.assertTrue(any(".catalog_source must be an object" in error for error in errors))
-
-    def test_rejects_non_https_ai_api_even_for_test_catalog(self):
+    def test_built_in_testing_site_requires_test_only(self):
         plan = valid_plan()
         control_plane = plan["request"]["receiver"]["control_plane"]
         control_plane.update(
             {
-                "catalog": "testing_override",
-                "catalog_source": {
-                    "source": "existing:evals/files/test-site-catalog.json#testing"
-                },
-                "test_only": True,
-                "tls_verification": "disabled_for_testing",
+                "catalog": "builtin_testing",
+                "site_code": "testing",
                 "ai_api_endpoint": {
-                    "value": "http://testing-ft2x-ai-api.dataflux.cn"
+                    "value": "https://testing-ft2x-ai-api.dataflux.cn"
                 },
             }
         )
 
         errors, _ = VALIDATOR.validate_plan(plan, "plan")
 
-        self.assertTrue(any("must be an HTTPS origin" in error for error in errors))
+        self.assertTrue(any(".test_only must be true" in error for error in errors))
+
+    def test_rejects_any_other_testing_ai_api(self):
+        plan = valid_plan()
+        control_plane = plan["request"]["receiver"]["control_plane"]
+        control_plane.update(
+            {
+                "catalog": "builtin_testing",
+                "site_code": "testing",
+                "test_only": True,
+                "tls_verification": "disabled_for_testing",
+                "ai_api_endpoint": {
+                    "value": "https://testing-ai-api.dataflux.cn"
+                },
+            }
+        )
+
+        errors, _ = VALIDATOR.validate_plan(plan, "plan")
+
+        self.assertTrue(
+            any("must be https://testing-ft2x-ai-api.dataflux.cn" in error for error in errors)
+        )
 
     def test_plan_only_request_requires_revision_review_for_implementation(self):
         errors, _ = VALIDATOR.validate_plan(valid_plan(), "implement")
@@ -339,6 +398,47 @@ class ValidateContractTests(unittest.TestCase):
         errors, _ = VALIDATOR.validate_plan(plan, "implement")
 
         self.assertEqual([], errors)
+
+    def test_control_plane_state_keeps_mapping_observations_out_of_the_gate(self):
+        plan = valid_plan()
+        state = valid_control_plane_state(plan)
+        state["applications"]["web"]["observations"] = {
+            "client_token_sync_status": "failed",
+            "mapping_status": "failed",
+            "mapping_ready": False,
+        }
+
+        errors, warnings = VALIDATOR.validate_control_plane_state(state, plan)
+
+        self.assertEqual([], errors)
+        self.assertEqual([], warnings)
+
+    def test_control_plane_state_requires_only_a_current_persisted_token(self):
+        plan = valid_plan()
+        state = valid_control_plane_state(plan)
+
+        state["applications"]["web"]["token_expired"] = True
+        errors, _ = VALIDATOR.validate_control_plane_state(state, plan)
+        self.assertTrue(any("token_expired must be false" in error for error in errors))
+
+        state = valid_control_plane_state(plan)
+        state["applications"]["web"]["client_token_available"] = False
+        errors, _ = VALIDATOR.validate_control_plane_state(state, plan)
+        self.assertTrue(
+            any("client_token_available must be true" in error for error in errors)
+        )
+
+    def test_control_plane_state_is_bound_to_the_stable_plan_digest(self):
+        plan = valid_plan()
+        state = valid_control_plane_state(plan)
+        plan["planned_changes"][0]["file"] = "src/monitoring/rum.ts"
+
+        errors, _ = VALIDATOR.validate_control_plane_state(state, plan)
+
+        self.assertIn(
+            "control-plane state plan_digest does not match this plan",
+            errors,
+        )
 
     def test_rejects_inconsistent_approval_status_and_basis(self):
         plan = valid_plan()
@@ -619,7 +719,7 @@ class ValidateContractTests(unittest.TestCase):
 
         self.assertEqual([], errors)
 
-    def test_testing_override_requires_revision_review(self):
+    def test_built_in_testing_site_requires_revision_review(self):
         plan = valid_plan()
         plan["request"]["intent"] = "implement"
         plan["approval"].update(
@@ -631,10 +731,7 @@ class ValidateContractTests(unittest.TestCase):
         control_plane = plan["request"]["receiver"]["control_plane"]
         control_plane.update(
             {
-                "catalog": "testing_override",
-                "catalog_source": {
-                    "source": "existing:evals/files/test-site-catalog.json#testing"
-                },
+                "catalog": "builtin_testing",
                 "site_code": "testing",
                 "ai_api_endpoint": {
                     "value": "https://testing-ft2x-ai-api.dataflux.cn"

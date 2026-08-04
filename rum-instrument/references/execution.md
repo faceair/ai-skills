@@ -59,7 +59,7 @@ Explicit implementation intent is not blanket approval. Stop with `status: pendi
 - an uncommitted file or hunk overlapping a planned edit;
 - SDK dependency upgrade, replacement, removal, or unverifiable provenance;
 - new Logs, Trace, Replay, WebView, native crash, ANR, freeze, UI-block, Remote Config, Canvas Replay, Sourcemap, symbol, or other optional scope;
-- a non-production catalog, disabled TLS verification, or another test-only exception;
+- the built-in testing site, disabled TLS verification, or another test-only exception;
 - no safe ignored runtime Client Token sink;
 - a remote mutation such as application creation, deployment, or artifact upload;
 - a material change to targets, files, receiver mode, signals, privacy behavior, or artifact handling after plan validation.
@@ -84,7 +84,7 @@ Batch by independently deployable target while respecting shared initialization/
 
 Rerunning the Skill must converge on one initializer and one canonical configuration path.
 
-Planning never consumes the temporary authorization code. Authorized Public DataWay implementation resolves the application, persists its non-secret metadata, updates/revalidates the plan, and routes its Client Token once before application-code edits; a rerun preserves an existing safe runtime sink instead of exchanging another code. DataKit implementation requires evidence that the RUM collector is enabled and the application runtime can reach its receiver.
+Planning never consumes the temporary authorization code. Authorized Public DataWay implementation first validates the stable plan, then performs credential-free receiver checks before reading the code, resolves each application once, and persists the Client Token plus digest-bound non-secret execution state before application-code edits. Sync/mapping observations never cause polling or plan revision. Revalidate the stable plan together with the state; revise only when application metadata changes a material decision. A rerun preserves an existing safe runtime sink and matching state instead of exchanging another code. DataKit implementation requires evidence that the RUM collector is enabled and the application runtime can reach its receiver.
 
 ## Remote actions
 

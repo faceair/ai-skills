@@ -88,9 +88,9 @@ Use plan schema version 2:
 }
 ```
 
-During initial planning, resolve only the site catalog and use `status: "catalog_resolved"`; new Client Token references use `availability: "planned"`, while an already reviewed runtime sink uses `"existing"`. `temporary_authorization_code` is either absent or a redacted source reference. After plan-phase validation and implementation authorization, run the helper before application-code edits, persist its non-secret metadata, revise the same plan to `status: "resolved"`, set Token availability to `"persisted"`/`"existing"`, and record application-type verification. Revalidate the resolved plan before implementation. If this changes material scope or reveals a type mismatch, increment the revision and require Review. If catalog or application resolution cannot complete, use `status: "blocked"` plus concrete `blockers`; blocked plans omit `client_tokens`. Never fill an inferred endpoint. API Key persistence is always `memory_only`.
+Resolve the site catalog during planning and keep `status: "catalog_resolved"` stable; new Client Token references use `availability: "planned"`, while an already reviewed runtime sink uses `"existing"`. `temporary_authorization_code` is either absent or a redacted source reference. After plan-phase validation and implementation authorization, run the helper before application-code edits and persist the result in `.rum/control-plane-state.json` or another reviewed Git-ignored path. Do not copy network, credential, Token-persistence, lookup-attempt, sync, or mapping state into the plan. Increment the plan revision only when application metadata changes the selected adapter/edit set or reveals a user-type mismatch. If site resolution cannot complete, use `status: "blocked"` plus concrete `blockers`; blocked plans omit `client_tokens`. Never fill an inferred endpoint. API Key persistence is always `memory_only`.
 
-An explicitly approved non-production override uses `catalog: "testing_override"`, `catalog_source` with an `env:` or `existing:` source reference, and `test_only: true`. Its `tls_verification` is `verified` or `disabled_for_testing`; the latter is invalid for official catalogs. Even a test override requires an HTTPS `ai_api_endpoint`. Do not represent a custom AI API as a standard Prompt field.
+The only non-production site uses `catalog: "builtin_testing"`, `site_code: "testing"`, `test_only: true`, and `ai_api_endpoint.value: "https://testing-ft2x-ai-api.dataflux.cn"`. Do not accept `catalog_source`, read a site from `evals/`, or support another testing AI API. `tls_verification` is `verified` or `disabled_for_testing`; the latter is invalid for official catalogs. Do not represent a custom AI API as a standard Prompt field.
 
 Normalize the user-supplied Application ID shape in `request.application_id_input`. A scalar uses `{"kind":"scalar","reference":{...}}`. A map uses `{"kind":"map","references":{"android":{...},"ios":{...}}}` with the original user-facing keys preserved.
 
@@ -192,7 +192,7 @@ The validator derives material review reasons from these structured fields. Do n
 
 Every confirmed slot must have exactly one Application ID reference. Missing IDs are permitted only when target disposition is `blocked` and the missing slots appear in `blockers`. Do not silently reuse one ID.
 
-Every confirmed slot also records one application type. Allowed values are `web`, `miniapp`, `android`, `ios`, `custom`, `reactnative`, and `harmonyos`; allowed sources are `user`, `ai_api`, and `repository`. `verification` is `pending` before Public DataWay lookup, `matched`/`mismatched` after lookup, or `not_applicable` for DataKit. `api_value` is null until lookup and then records the supported API value. A user value takes precedence, but `mismatched` is a material review condition.
+Every confirmed slot also records one application type. Allowed values are `web`, `miniapp`, `android`, `ios`, `custom`, `reactnative`, and `harmonyos`; allowed sources are `user`, `ai_api`, and `repository`. Public DataWay may keep `verification: pending` and `api_value: null` while matching runtime observations remain in the digest-bound control-plane state. Update the plan to `matched`/`mismatched` plus `api_value` only when application metadata changes a stable decision or a user mismatch must be reviewed. DataKit uses `not_applicable`. A user value takes precedence, but `mismatched` is a material review condition.
 
 Every target with disposition `planned` must be covered by at least one `planned_changes` entry:
 
@@ -247,7 +247,7 @@ For a normal one-Prompt implementation request, write:
 }
 ```
 
-Explicit implementation authorization does not cover ambiguous Application ID mapping, user/AI application-type conflict, an overlapping dirty hunk, dependency upgrade/replacement/removal, any new optional signal, release-artifact scope, a test catalog/TLS exception, an unsafe Client Token sink, remote mutation, or a material change to the planned files or behavior. Those cases require a revised plan and `revision_review`.
+Explicit implementation authorization does not cover ambiguous Application ID mapping, user/AI application-type conflict, an overlapping dirty hunk, dependency upgrade/replacement/removal, any new optional signal, release-artifact scope, the built-in testing site or a TLS exception, an unsafe Client Token sink, remote mutation, or a material change to the planned files or behavior. Those cases require a revised plan and `revision_review`.
 
 Record approver/time only when known; never invent them. Increment `revision` whenever the target graph, receiver, SDK choice, signals, privacy behavior, artifacts, or exact edit set changes.
 
@@ -268,6 +268,70 @@ For `revision_review`, also record:
 Set the reviewed revision and `reviewed_overlaps` first, then obtain the canonical plan digest with `validate_contract.py <plan> --print-review-digest` and store that exact output as `reviewed_plan_sha256`. `reviewed_overlaps` is empty unless a planned file was already dirty when the plan was created. For each approved overlap, hash the exact reviewed file bytes; implementation validation accepts it only while that file still has the same digest. A new dirty planned file or post-Review change remains blocked.
 
 Plan schema version 1 is stale under this authorization model. Preserve usable connection-source references, rebuild repository analysis as schema version 2, increment the revision, and request review only when the original request was plan-only or a material blocker remains.
+
+## `.rum/control-plane-state.json`
+
+Public DataWay implementation uses a separate Git-ignored, non-secret execution state:
+
+```json
+{
+  "schema_version": 1,
+  "kind": "rum_control_plane_state",
+  "plan_digest": "sha256:<canonical-plan-digest>",
+  "site": {
+    "code": "cn3",
+    "catalog": "https://urls.guance.com/",
+    "dataway_url": "https://cn3-openway.guance.com",
+    "ai_api": "https://cn3-ai-api.guance.com",
+    "tls_verification": "verified"
+  },
+  "network_preflight": {
+    "status": "passed",
+    "dataway": {"status": "reachable", "http_status": 404},
+    "ai_api": {"status": "reachable", "http_status": 401}
+  },
+  "credential_resolution": {
+    "status": "resolved",
+    "exchange_path": "/api/v1/account/accesskey/exchange",
+    "application_lookup_path": "/api/v1/rum/app/get",
+    "api_key_persistence": "memory_only"
+  },
+  "applications": {
+    "web": {
+      "app_id": "web_demo",
+      "api_app_type": "web",
+      "selected_app_type": "web",
+      "selected_app_type_source": "ai_api",
+      "type_mismatch": false,
+      "token_expired": false,
+      "client_token_available": true,
+      "network_attempts": 1,
+      "observations": {
+        "client_token_sync_status": "queued",
+        "mapping_status": "pending",
+        "mapping_ready": false
+      }
+    }
+  },
+  "client_tokens": {
+    "web": {
+      "source": "runtime:GUANCE_RUM_CLIENT_TOKEN",
+      "availability": "persisted"
+    }
+  }
+}
+```
+
+Generate `plan_digest` with `validate_contract.py .rum/plan.json --print-review-digest` after finalizing the authorized revision. The state must match the plan's catalog, site code, AI API, Application ID slots, application types, and Client Token references. Token acceptance requires only `token_expired: false`, a present non-empty `client_token` during helper execution, and `client_token_available: true` in this redacted state. Sync/mapping observations never gate implementation and never alter the plan digest.
+
+Validate the pair before editing application code:
+
+```bash
+python3 <skill-dir>/scripts/validate_contract.py .rum/plan.json \
+  --phase implement \
+  --execution-state .rum/control-plane-state.json \
+  --repository <repository-root>
+```
 
 ## `.rum/instrumentation.json`
 
