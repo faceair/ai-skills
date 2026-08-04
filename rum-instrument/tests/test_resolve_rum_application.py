@@ -244,14 +244,14 @@ class ResolveRumApplicationTests(unittest.TestCase):
             result = RESOLVER.build_safe_result(
                 {"application": {"app_id": "demo"}},
                 plan_digest=PLAN_DIGEST,
-                client_token_environments={
+                client_token_keys={
                     "default": "GUANCE_RUM_CLIENT_TOKEN"
                 },
                 secret_file=written,
             )
 
             self.assertEqual(
-                "GUANCE_RUM_CLIENT_TOKEN=synthetic-client-token\n",
+                'GUANCE_RUM_CLIENT_TOKEN="synthetic-client-token"\n',
                 output.read_text(encoding="utf-8"),
             )
             self.assertEqual(0o600, stat.S_IMODE(output.stat().st_mode))
@@ -260,6 +260,42 @@ class ResolveRumApplicationTests(unittest.TestCase):
                 "runtime:GUANCE_RUM_CLIENT_TOKEN",
                 result["client_tokens"]["default"]["source"],
             )
+
+    def test_supported_sink_formats_escape_arbitrary_nonempty_tokens(self):
+        token = 'token with spaces="quotes"\\and\nnewlines'
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            cases = {
+                "dotenv": (root / ".env.local", "RUM_CLIENT_TOKEN"),
+                "json": (root / "rum.local.json", "rumClientToken"),
+                "properties": (root / "local.properties", "rum.client.token"),
+                "xcconfig": (root / "Secrets.xcconfig", "RUM_CLIENT_TOKEN"),
+            }
+            for sink_format, (path, key) in cases.items():
+                with self.subTest(sink_format=sink_format):
+                    snapshot = RESOLVER.SecretSinkSnapshot(
+                        path=path,
+                        existed_before=False,
+                        previous_bytes=None,
+                        previous_mode=None,
+                        sink_format=sink_format,
+                        scope="external",
+                    )
+                    RESOLVER.write_client_tokens_sink(
+                        snapshot,
+                        {"default": key},
+                        {"default": token},
+                    )
+                    self.assertEqual(0o600, stat.S_IMODE(path.stat().st_mode))
+                    if sink_format == "json":
+                        self.assertEqual(
+                            token,
+                            json.loads(path.read_text(encoding="utf-8"))[key],
+                        )
+                    else:
+                        rendered = path.read_text(encoding="utf-8")
+                        self.assertIn(key, rendered)
+                        self.assertNotIn("\nand\n", rendered)
 
     def test_multiple_applications_share_one_api_key_exchange(self):
         site = RESOLVER.Site(
@@ -559,7 +595,7 @@ class ResolveRumApplicationTests(unittest.TestCase):
         self.assertEqual(0, result)
         self.assertNotIn(temporary_code, rendered)
         self.assertNotIn(client_token, rendered)
-        self.assertIn("runtime:GUANCE_RUM_CLIENT_TOKEN", rendered)
+        self.assertIn("runtime:RUM_CLIENT_TOKEN", rendered)
         self.assertEqual(temporary_code, resolve_applications.call_args.args[2])
 
     def test_cli_requires_secret_sink_before_catalog_or_code_access(self):
@@ -926,42 +962,43 @@ class ResolveRumApplicationTests(unittest.TestCase):
                     repository=subdirectory,
                 )
 
-    def test_existing_secret_sink_stops_before_credential_exchange(self):
+    def test_existing_secret_sink_is_atomically_upserted(self):
         with tempfile.TemporaryDirectory() as temporary:
-            output = Path(temporary) / "existing.env"
-            output.write_text("existing-content\n", encoding="utf-8")
-            state = Path(temporary) / "control-plane-state.json"
-            stderr = io.StringIO()
-            with (
-                mock.patch.object(RESOLVER, "resolve_site") as resolve_site,
-                mock.patch.object(
-                    sys,
-                    "argv",
-                    [
-                        str(SCRIPT),
-                        "--dataway-url",
-                        "https://openway.guance.com",
-                        "--app-id",
-                        "web_demo",
-                        "--client-token-env-file",
-                        str(output),
-                        "--state-file",
-                        str(state),
-                        "--plan-digest",
-                        PLAN_DIGEST,
-                    ],
-                ),
-                redirect_stderr(stderr),
-            ):
-                result = RESOLVER.main()
+            repository = Path(temporary)
+            self.init_git(repository)
+            (repository / ".gitignore").write_text(".env.local\n", encoding="utf-8")
+            output = repository / ".env.local"
+            output.write_text(
+                "UNCHANGED=value\nRUM_CLIENT_TOKEN=old\n",
+                encoding="utf-8",
+            )
+            snapshot = RESOLVER.inspect_secret_sink(
+                output,
+                sink_format="dotenv",
+                keys={"default": "RUM_CLIENT_TOKEN"},
+                repository=repository,
+                allow_external=False,
+            )
+            RESOLVER.write_client_tokens_sink(
+                snapshot,
+                {"default": "RUM_CLIENT_TOKEN"},
+                {"default": "new token\nwith newline"},
+            )
 
-            self.assertEqual(1, result)
-            resolve_site.assert_not_called()
             self.assertEqual(
-                "existing-content\n",
+                'UNCHANGED=value\nRUM_CLIENT_TOKEN="new token\\nwith newline"\n',
                 output.read_text(encoding="utf-8"),
             )
-            self.assertIn("refusing to overwrite", stderr.getvalue())
+            self.assertEqual(0o600, stat.S_IMODE(output.stat().st_mode))
+            RESOLVER.restore_secret_sink(snapshot)
+            self.assertEqual(
+                "UNCHANGED=value\nRUM_CLIENT_TOKEN=old\n",
+                output.read_text(encoding="utf-8"),
+            )
+            self.assertEqual(
+                snapshot.previous_mode,
+                stat.S_IMODE(output.stat().st_mode),
+            )
 
 
 if __name__ == "__main__":

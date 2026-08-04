@@ -19,25 +19,20 @@ class SkillContractTests(unittest.TestCase):
             "temporaryAuthCode",
             "datakitUrl",
             "appId",
-            "template:NAME",
         ):
             with self.subTest(field=field):
                 self.assertIn(field, skill)
 
-        self.assertIn("Do not require a separate config file", skill)
-        self.assertIn("Do not fan one scalar ID out", skill)
-        self.assertIn("Do not put `clientToken` or `aiApiEndpoint` in the standard prompt", skill)
-        self.assertIn(
-            "temporaryAuthCode: <paste for one-prompt implementation or provide after plan review>",
-            skill,
-        )
+        minimal_prompt = skill.split("## Minimal prompt", 1)[1].split("## Workflow", 1)[0]
+        self.assertNotIn("clientToken:", minimal_prompt)
+        self.assertNotIn("aiApiEndpoint:", minimal_prompt)
         self.assertIn("prompt:provided", skill)
         self.assertIn(
-            "Do not consume the code until the plan has passed plan-phase validation",
+            "pass it to the helper through stdin after authorization",
             skill,
         )
         self.assertIn(
-            "Only `temporary_authorization_code`/`temporaryAuthCode` may use",
+            '{"source":"prompt:provided"}',
             self.read("references/contracts.md"),
         )
 
@@ -46,21 +41,21 @@ class SkillContractTests(unittest.TestCase):
         execution = self.read("references/execution.md")
         contracts = self.read("references/contracts.md")
 
-        self.assertIn("Create and authorize the plan", skill)
-        self.assertIn("continue directly to step 7 in the same run", skill)
-        self.assertIn("Do not ask for an `approvalMode` field", skill)
+        self.assertIn("Build and validate the plan", skill)
+        self.assertIn("continue in the same run", skill)
+        self.assertIn("Do not require a routine second approval", skill)
         self.assertIn('"status": "pending"', contracts)
         self.assertIn('"basis": "plan_only_request"', contracts)
-        self.assertIn('"basis": "explicit_implementation_request"', contracts)
+        self.assertIn("explicit_implementation_request", contracts)
         self.assertIn('"revision": 1', contracts)
         self.assertIn("Explicit implementation intent is not blanket approval", execution)
         self.assertIn("basis: revision_review", execution)
         self.assertIn("reviewed_plan_sha256", contracts)
         self.assertIn("--print-review-digest", contracts)
         self.assertIn("reviewed_overlaps", contracts)
-        self.assertIn("existing_instrumentation.signals", contracts)
-        self.assertIn("profile.signals", contracts)
-        self.assertIn("validator derives material review reasons", contracts.lower())
+        self.assertIn('"existing_instrumentation"', contracts)
+        self.assertIn('"profile"', contracts)
+        self.assertIn("Any new optional capability is review scope", contracts)
 
     def test_all_official_rum_application_families_have_adapters(self):
         skill = self.read("SKILL.md")
@@ -89,11 +84,10 @@ class SkillContractTests(unittest.TestCase):
         privacy = self.read("references/privacy-security.md")
         contracts = self.read("references/contracts.md")
 
-        self.assertIn("never echo, inspect, or persist its value", skill)
+        self.assertIn("Keep authorization codes, API Keys, and Client Token values out", skill)
         self.assertIn("uploaded only after explicit authorization", privacy)
         self.assertNotIn('"client_token": "<', contracts)
-        self.assertIn('"remote_verification"', contracts)
-        self.assertIn('"verified": false', contracts)
+        self.assertIn("remote_verification.verified: false", contracts)
 
     def test_public_dataway_uses_catalog_and_ai_api_helper(self):
         skill = self.read("SKILL.md")
@@ -115,16 +109,15 @@ class SkillContractTests(unittest.TestCase):
         self.assertIn("temporary-auth-code-stdin", helper)
         self.assertIn("getpass.getpass", helper)
         self.assertIn("--site-only", skill)
-        self.assertIn("application lookup requires --client-token-env-file", helper)
+        self.assertIn("application lookup requires --client-token-sink", helper)
         self.assertIn("application lookup requires --state-file", helper)
         self.assertIn("application lookup requires --plan-digest", helper)
         self.assertIn("--allow-external-secret-sink", helper)
-        self.assertIn(
-            "removes the new secret sink if state persistence fails",
-            skill,
-        )
-        self.assertIn("credential-free HTTP reachability checks", skill)
-        self.assertIn("never poll for them", skill)
+        for sink_format in ("dotenv", "json", "properties", "xcconfig"):
+            self.assertIn(sink_format, helper)
+        self.assertIn("restores the previous sink", skill)
+        self.assertIn("credential-free network preflight", skill)
+        self.assertIn("never polls mapping state", skill)
         self.assertNotIn("OWL_REGISTRY_ENDPOINT", helper)
         self.assertIn("use `OWL_REGISTRY_ENDPOINT`", control_plane)
 
@@ -145,7 +138,7 @@ class SkillContractTests(unittest.TestCase):
             with self.subTest(removed=removed):
                 self.assertNotIn(removed, skill + control_plane + validator)
 
-        minimal_contract = skill.split("## Minimal input contract", 1)[1].split(
+        minimal_contract = skill.split("## Minimal prompt", 1)[1].split(
             "## Workflow",
             1,
         )[0]
@@ -172,15 +165,16 @@ class SkillContractTests(unittest.TestCase):
         agent = self.read("agents/openai.yaml")
 
         self.assertLess(len(skill_lines), 500)
-        self.assertIn('display_name: "Guance RUM Instrumentation"', agent)
+        self.assertIn('display_name: "RUM Instrumentation"', agent)
         self.assertIn("$rum-instrument", agent)
+        self.assertIn("Load references progressively", self.read("SKILL.md"))
 
     def test_optional_capabilities_are_repository_or_user_driven(self):
         skill = self.read("SKILL.md")
         common = self.read("references/common.md")
 
         self.assertIn(
-            "only when the repository already uses them or the user requests them",
+            "do not enable absent Logs, Trace, Replay",
             skill,
         )
         self.assertIn("Core RUM is the default planning scope", common)
@@ -247,6 +241,37 @@ class SkillContractTests(unittest.TestCase):
         ):
             with self.subTest(value=value):
                 self.assertIn(value, contracts + validator)
+
+    def test_markdown_is_brand_neutral(self):
+        forbidden = ("guance", "观测云", "观测")
+        markdown_files = [SKILL_DIR / "SKILL.md", *SKILL_DIR.glob("references/*.md")]
+
+        for path in markdown_files:
+            content = path.read_text(encoding="utf-8").lower()
+            for term in forbidden:
+                with self.subTest(path=path.name, term=term):
+                    self.assertNotIn(term, content)
+
+    def test_primary_source_registry_covers_every_adapter(self):
+        import json
+
+        registry = json.loads(self.read("references/official-sources.json"))
+        self.assertEqual(
+            {
+                "android",
+                "apple",
+                "cpp",
+                "flutter",
+                "harmonyos",
+                "macos",
+                "miniapp",
+                "react_native",
+                "uniapp",
+                "unity",
+                "web",
+            },
+            set(registry),
+        )
 
 if __name__ == "__main__":
     unittest.main()

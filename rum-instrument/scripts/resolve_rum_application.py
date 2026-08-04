@@ -13,6 +13,7 @@ import re
 import ssl
 import subprocess
 import sys
+import tempfile
 import time
 from typing import Any, Callable
 from urllib.error import HTTPError, URLError
@@ -39,14 +40,15 @@ APPLICATION_TYPES = {
     "reactnative",
     "harmonyos",
 }
-CLIENT_TOKEN_PATTERN = re.compile(r"^[A-Za-z0-9._~+/=-]+$")
 ENV_NAME_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+PROPERTY_KEY_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+$")
 SLOT_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 SHA256_PATTERN = re.compile(r"^sha256:[0-9a-f]{64}$")
+SINK_FORMATS = {"dotenv", "json", "properties", "xcconfig"}
 EXCHANGE_PATH = "/api/v1/account/accesskey/exchange"
 RUM_APP_GET_PATH = "/api/v1/rum/app/get"
-DEFAULT_TEMP_CODE_ENV = "GUANCE_TEMP_AUTH_CODE"
-DEFAULT_CLIENT_TOKEN_ENV = "GUANCE_RUM_CLIENT_TOKEN"
+DEFAULT_TEMP_CODE_ENV = "RUM_TEMP_AUTH_CODE"
+DEFAULT_CLIENT_TOKEN_KEY = "RUM_CLIENT_TOKEN"
 
 
 class ResolutionError(RuntimeError):
@@ -66,6 +68,16 @@ class Site:
     ai_api_url: str
     catalog_kind: str = "official"
     tls_verification: str = "verified"
+
+
+@dataclass(frozen=True)
+class SecretSinkSnapshot:
+    path: Path
+    existed_before: bool
+    previous_bytes: bytes | None
+    previous_mode: int | None
+    sink_format: str
+    scope: str
 
 
 JsonFetcher = Callable[[str], dict[str, Any]]
@@ -543,8 +555,246 @@ def _require_git_ignored(path: Path, repository: Path) -> None:
         raise ResolutionError("git is required to verify an in-repository secret file") from None
     if result.returncode != 0:
         raise ResolutionError(
-            "the requested client-token env file is inside the repository but is not git-ignored"
+            "the requested client-token sink is inside the repository but is not git-ignored"
         )
+
+
+def infer_sink_format(path: Path, requested: str | None = None) -> str:
+    if requested is not None:
+        if requested not in SINK_FORMATS:
+            raise ResolutionError(
+                "client-token sink format must be dotenv, json, properties, or xcconfig"
+            )
+        return requested
+    name = path.name.lower()
+    if name.endswith(".json"):
+        return "json"
+    if name.endswith(".properties"):
+        return "properties"
+    if name.endswith(".xcconfig"):
+        return "xcconfig"
+    return "dotenv"
+
+
+def validate_sink_keys(keys: dict[str, str], sink_format: str) -> None:
+    if not keys or len(set(keys.values())) != len(keys):
+        raise ResolutionError("every Client Token must have one unique sink key")
+    for key in keys.values():
+        valid = (
+            bool(ENV_NAME_PATTERN.fullmatch(key))
+            if sink_format in {"dotenv", "xcconfig"}
+            else (
+                bool(PROPERTY_KEY_PATTERN.fullmatch(key))
+                if sink_format == "properties"
+                else isinstance(key, str)
+                and bool(key.strip())
+                and not any(ord(character) < 32 for character in key)
+            )
+        )
+        if not valid:
+            raise ResolutionError(
+                f"client-token sink key is invalid for {sink_format}"
+            )
+
+
+def inspect_secret_sink(
+    path: Path,
+    *,
+    sink_format: str,
+    keys: dict[str, str],
+    repository: Path,
+    allow_external: bool,
+) -> SecretSinkSnapshot:
+    validate_sink_keys(keys, sink_format)
+    candidate = path.expanduser()
+    if candidate.is_symlink():
+        raise ResolutionError("client-token sink must not be a symlink")
+    output = candidate.resolve(strict=False)
+    repository_root = repository.expanduser().resolve()
+    _require_git_ignored(output, repository_root)
+    inside_repository = _is_within(output, repository_root)
+    if not inside_repository and not allow_external:
+        raise ResolutionError(
+            "an external client-token sink requires --allow-external-secret-sink"
+        )
+    if output.exists() and not output.is_file():
+        raise ResolutionError("client-token sink must be a regular file")
+    try:
+        previous_bytes = output.read_bytes() if output.exists() else None
+        previous_mode = (
+            output.stat().st_mode & 0o777 if output.exists() else None
+        )
+    except OSError:
+        raise ResolutionError("client-token sink could not be read safely") from None
+    return SecretSinkSnapshot(
+        path=output,
+        existed_before=output.exists(),
+        previous_bytes=previous_bytes,
+        previous_mode=previous_mode,
+        sink_format=sink_format,
+        scope="repository" if inside_repository else "external",
+    )
+
+
+def _encode_assignment_value(value: str, sink_format: str) -> str:
+    if sink_format in {"dotenv", "xcconfig"}:
+        return json.dumps(value, ensure_ascii=False)
+    if sink_format == "properties":
+        rendered: list[str] = []
+        for character in value:
+            if character == "\\":
+                rendered.append("\\\\")
+            elif character == "\n":
+                rendered.append("\\n")
+            elif character == "\r":
+                rendered.append("\\r")
+            elif character == "\t":
+                rendered.append("\\t")
+            elif ord(character) < 32:
+                rendered.append(f"\\u{ord(character):04x}")
+            else:
+                rendered.append(character)
+        return "".join(rendered)
+    raise ResolutionError(f"unsupported client-token sink format: {sink_format}")
+
+
+def _render_assignment_sink(
+    existing: str,
+    keys: dict[str, str],
+    client_tokens: dict[str, str],
+    sink_format: str,
+) -> str:
+    separator = " = " if sink_format == "xcconfig" else "="
+    patterns = {
+        slot: re.compile(
+            (
+                rf"^\s*(?:export\s+)?{re.escape(key)}\s*="
+                if sink_format == "dotenv"
+                else rf"^\s*{re.escape(key)}\s*[:=]"
+            )
+        )
+        for slot, key in keys.items()
+    }
+    rendered_lines: list[str] = []
+    replaced: set[str] = set()
+    for line in existing.splitlines(keepends=True):
+        content = line.rstrip("\r\n")
+        ending = line[len(content):]
+        matching = [slot for slot, pattern in patterns.items() if pattern.match(content)]
+        if not matching:
+            rendered_lines.append(line)
+            continue
+        slot = matching[0]
+        if slot in replaced:
+            continue
+        rendered_lines.append(
+            f"{keys[slot]}{separator}"
+            f"{_encode_assignment_value(client_tokens[slot], sink_format)}"
+            f"{ending}"
+        )
+        replaced.add(slot)
+    if existing and not existing.endswith(("\n", "\r")):
+        rendered_lines.append(os.linesep)
+    for slot in sorted(set(keys) - replaced):
+        rendered_lines.append(
+            f"{keys[slot]}{separator}"
+            f"{_encode_assignment_value(client_tokens[slot], sink_format)}"
+            f"{os.linesep}"
+        )
+    return "".join(rendered_lines)
+
+
+def _render_secret_sink(
+    existing: bytes | None,
+    keys: dict[str, str],
+    client_tokens: dict[str, str],
+    sink_format: str,
+) -> bytes:
+    try:
+        current_text = existing.decode("utf-8") if existing is not None else ""
+    except UnicodeDecodeError:
+        raise ResolutionError("existing client-token sink must be UTF-8") from None
+    if sink_format == "json":
+        if current_text.strip():
+            try:
+                payload = json.loads(current_text)
+            except json.JSONDecodeError:
+                raise ResolutionError(
+                    "existing JSON client-token sink is invalid"
+                ) from None
+            if not isinstance(payload, dict):
+                raise ResolutionError(
+                    "existing JSON client-token sink must contain an object"
+                )
+        else:
+            payload = {}
+        for slot, key in keys.items():
+            payload[key] = client_tokens[slot]
+        return (
+            json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+        ).encode("utf-8")
+    return _render_assignment_sink(
+        current_text,
+        keys,
+        client_tokens,
+        sink_format,
+    ).encode("utf-8")
+
+
+def _atomic_write(path: Path, payload: bytes, mode: int = 0o600) -> None:
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.",
+        dir=path.parent,
+    )
+    temporary_path = Path(temporary_name)
+    try:
+        os.fchmod(descriptor, mode)
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary_path, path)
+        os.chmod(path, mode)
+    except OSError:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+        temporary_path.unlink(missing_ok=True)
+        raise ResolutionError("client-token sink could not be written safely") from None
+
+
+def write_client_tokens_sink(
+    snapshot: SecretSinkSnapshot,
+    keys: dict[str, str],
+    client_tokens: dict[str, str],
+) -> Path:
+    if set(keys) != set(client_tokens):
+        raise ResolutionError("every Client Token must have exactly one sink key")
+    validate_sink_keys(keys, snapshot.sink_format)
+    payload = _render_secret_sink(
+        snapshot.previous_bytes,
+        keys,
+        client_tokens,
+        snapshot.sink_format,
+    )
+    _atomic_write(snapshot.path, payload)
+    return snapshot.path
+
+
+def restore_secret_sink(snapshot: SecretSinkSnapshot) -> None:
+    if snapshot.existed_before:
+        assert snapshot.previous_bytes is not None
+        _atomic_write(
+            snapshot.path,
+            snapshot.previous_bytes,
+            snapshot.previous_mode
+            if snapshot.previous_mode is not None
+            else 0o600,
+        )
+    else:
+        snapshot.path.unlink(missing_ok=True)
 
 
 def write_client_token_env(
@@ -571,44 +821,38 @@ def write_client_tokens_env(
 ) -> Path:
     if set(environment_names) != set(client_tokens) or not environment_names:
         raise ResolutionError("every Client Token must have exactly one runtime environment name")
-    if len(set(environment_names.values())) != len(environment_names):
-        raise ResolutionError("client-token environment names must be unique")
-    for environment_name in environment_names.values():
-        if not ENV_NAME_PATTERN.fullmatch(environment_name):
-            raise ResolutionError("client-token environment name is invalid")
-    for client_token in client_tokens.values():
-        if not CLIENT_TOKEN_PATTERN.fullmatch(client_token):
-            raise ResolutionError("client token contains characters unsafe for a dotenv assignment")
-
-    candidate = path.expanduser()
-    if candidate.exists() or candidate.is_symlink():
-        raise ResolutionError("client-token env file already exists; refusing to overwrite it")
-    output = candidate.resolve()
-    if repository is not None:
-        _require_git_ignored(output, repository)
-
-    created = False
-    try:
-        output.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        descriptor = os.open(output, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        created = True
-        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-            for slot in sorted(client_tokens):
-                stream.write(f"{environment_names[slot]}={client_tokens[slot]}\n")
-        os.chmod(output, 0o600)
-    except OSError:
-        if created:
-            output.unlink(missing_ok=True)
-        raise ResolutionError("client-token env file could not be created safely") from None
-    return output
+    if repository is None:
+        candidate = path.expanduser()
+        if candidate.is_symlink():
+            raise ResolutionError("client-token sink must not be a symlink")
+        output = candidate.resolve(strict=False)
+        snapshot = SecretSinkSnapshot(
+            path=output,
+            existed_before=output.exists(),
+            previous_bytes=output.read_bytes() if output.exists() else None,
+            previous_mode=(output.stat().st_mode & 0o777) if output.exists() else None,
+            sink_format="dotenv",
+            scope="external",
+        )
+    else:
+        snapshot = inspect_secret_sink(
+            path,
+            sink_format="dotenv",
+            keys=environment_names,
+            repository=repository,
+            allow_external=True,
+        )
+    return write_client_tokens_sink(snapshot, environment_names, client_tokens)
 
 
 def build_safe_result(
     metadata: dict[str, Any],
     *,
     plan_digest: str,
-    client_token_environments: dict[str, str],
+    client_token_keys: dict[str, str],
     secret_file: Path | None,
+    sink_format: str = "dotenv",
+    sink_scope: str = "repository",
 ) -> dict[str, Any]:
     return {
         "schema_version": 1,
@@ -617,15 +861,20 @@ def build_safe_result(
         **metadata,
         "client_tokens": {
             slot: {
-                "source": f"runtime:{environment_name}",
+                "source": f"runtime:{key}",
                 "availability": "persisted" if secret_file is not None else "planned",
             }
-            for slot, environment_name in sorted(client_token_environments.items())
+            for slot, key in sorted(client_token_keys.items())
         },
         "secret_sink": (
             {
                 "path": str(secret_file),
-                "format": "dotenv",
+                "format": sink_format,
+                "scope": sink_scope,
+                "keys": {
+                    slot: key
+                    for slot, key in sorted(client_token_keys.items())
+                },
             }
             if secret_file is not None
             else None
@@ -650,18 +899,18 @@ def parse_slot_assignments(values: list[str] | None, field: str) -> dict[str, st
     return assignments
 
 
-def default_client_token_environments(application_ids: dict[str, str]) -> dict[str, str]:
+def default_client_token_keys(application_ids: dict[str, str]) -> dict[str, str]:
     if set(application_ids) == {"default"}:
-        return {"default": DEFAULT_CLIENT_TOKEN_ENV}
-    environments: dict[str, str] = {}
+        return {"default": DEFAULT_CLIENT_TOKEN_KEY}
+    keys: dict[str, str] = {}
     for slot in application_ids:
         normalized_slot = re.sub(r"[^A-Za-z0-9]+", "_", slot).strip("_").upper()
         if not normalized_slot:
-            raise ResolutionError(f"cannot derive a runtime environment name for appId slot {slot}")
-        environments[slot] = f"{DEFAULT_CLIENT_TOKEN_ENV}_{normalized_slot}"
-    if len(set(environments.values())) != len(environments):
-        raise ResolutionError("appId slots produce duplicate runtime environment names")
-    return environments
+            raise ResolutionError(f"cannot derive a runtime key for appId slot {slot}")
+        keys[slot] = f"{DEFAULT_CLIENT_TOKEN_KEY}_{normalized_slot}"
+    if len(set(keys.values())) != len(keys):
+        raise ResolutionError("appId slots produce duplicate runtime keys")
+    return keys
 
 
 def read_temporary_authorization_code(
@@ -754,11 +1003,24 @@ def main() -> int:
         help="read one code line from stdin; terminal input is hidden",
     )
     parser.add_argument(
+        "--client-token-key",
         "--client-token-env",
+        dest="client_token_key",
         action="append",
-        help="repeat [slot=]ENV_NAME; defaults are derived from appId slots",
+        help="repeat [slot=]KEY; defaults are derived from appId slots",
     )
-    parser.add_argument("--client-token-env-file", type=Path)
+    parser.add_argument(
+        "--client-token-sink",
+        "--client-token-env-file",
+        dest="client_token_sink",
+        type=Path,
+        help="Git-ignored local runtime/build configuration file",
+    )
+    parser.add_argument(
+        "--sink-format",
+        choices=sorted(SINK_FORMATS),
+        help="sink format; inferred from .json, .properties, or .xcconfig, otherwise dotenv",
+    )
     parser.add_argument("--repository", type=Path)
     parser.add_argument(
         "--state-file",
@@ -795,8 +1057,9 @@ def main() -> int:
                 or application_types
                 or arguments.temporary_auth_code_env
                 or arguments.temporary_auth_code_stdin
-                or arguments.client_token_env
-                or arguments.client_token_env_file
+                or arguments.client_token_key
+                or arguments.client_token_sink
+                or arguments.sink_format
                 or arguments.repository
                 or arguments.state_file
                 or arguments.plan_digest
@@ -808,9 +1071,9 @@ def main() -> int:
                 )
         elif not application_ids:
             raise ResolutionError("at least one --app-id is required unless --site-only is used")
-        elif arguments.client_token_env_file is None:
+        elif arguments.client_token_sink is None:
             raise ResolutionError(
-                "application lookup requires --client-token-env-file so the Client Token is not discarded"
+                "application lookup requires --client-token-sink so the Client Token is not discarded"
             )
         elif arguments.state_file is None:
             raise ResolutionError(
@@ -822,26 +1085,21 @@ def main() -> int:
             raise ResolutionError(
                 "application lookup requires --plan-digest as sha256:<64 lowercase hex>"
             )
-        client_token_environments = (
-            parse_slot_assignments(arguments.client_token_env, "client-token environment")
-            if arguments.client_token_env
-            else default_client_token_environments(application_ids)
+        client_token_keys = (
+            parse_slot_assignments(arguments.client_token_key, "client-token sink key")
+            if arguments.client_token_key
+            else default_client_token_keys(application_ids)
         )
         if set(application_types) - set(application_ids):
             raise ResolutionError("applicationType contains a slot that has no matching appId")
-        if set(client_token_environments) != set(application_ids):
+        if set(client_token_keys) != set(application_ids):
             raise ResolutionError(
-                "client-token environment slots must exactly match appId slots"
+                "client-token sink key slots must exactly match appId slots"
             )
-        if arguments.client_token_env_file is not None:
-            candidate = arguments.client_token_env_file.expanduser()
-            if candidate.exists() or candidate.is_symlink():
-                raise ResolutionError(
-                    "client-token env file already exists; refusing to overwrite it"
-                )
+        if arguments.client_token_sink is not None:
             if arguments.repository is None:
                 raise ResolutionError(
-                    "--client-token-env-file requires --repository for Git ignore verification"
+                    "--client-token-sink requires --repository for Git ignore verification"
                 )
         if arguments.state_file is not None:
             state_candidate = arguments.state_file.expanduser()
@@ -850,27 +1108,25 @@ def main() -> int:
                     "control-plane state file already exists; refusing to overwrite it"
                 )
             if (
-                arguments.client_token_env_file is not None
+                arguments.client_token_sink is not None
                 and state_candidate.resolve()
-                == arguments.client_token_env_file.expanduser().resolve()
+                == arguments.client_token_sink.expanduser().resolve()
             ):
                 raise ResolutionError(
-                    "control-plane state and client-token env files must use different paths"
+                    "control-plane state and client-token sink must use different paths"
                 )
-        if arguments.client_token_env_file is not None:
-            repository_root = arguments.repository.expanduser().resolve()
-            secret_output = arguments.client_token_env_file.expanduser().resolve()
-            if (
-                not _is_within(secret_output, repository_root)
-                and not arguments.allow_external_secret_sink
-            ):
-                raise ResolutionError(
-                    "an external client-token sink requires --allow-external-secret-sink"
-                )
-        if arguments.client_token_env_file is not None:
-            _require_git_ignored(
-                arguments.client_token_env_file.expanduser().resolve(),
-                arguments.repository,
+        sink_snapshot: SecretSinkSnapshot | None = None
+        if arguments.client_token_sink is not None:
+            sink_format = infer_sink_format(
+                arguments.client_token_sink,
+                arguments.sink_format,
+            )
+            sink_snapshot = inspect_secret_sink(
+                arguments.client_token_sink,
+                sink_format=sink_format,
+                keys=client_token_keys,
+                repository=arguments.repository,
+                allow_external=arguments.allow_external_secret_sink,
             )
         if arguments.state_file is not None:
             _require_git_ignored(
@@ -930,29 +1186,30 @@ def main() -> int:
             json_poster=selected_json_poster,
         )
         metadata["network_preflight"] = network_preflight
-        intended_secret_file = arguments.client_token_env_file.expanduser().resolve()
+        assert sink_snapshot is not None
         result = build_safe_result(
             metadata,
             plan_digest=arguments.plan_digest,
-            client_token_environments=client_token_environments,
-            secret_file=intended_secret_file,
+            client_token_keys=client_token_keys,
+            secret_file=sink_snapshot.path,
+            sink_format=sink_snapshot.sink_format,
+            sink_scope=sink_snapshot.scope,
         )
         rendered = json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True)
-        secret_file = write_client_tokens_env(
-            arguments.client_token_env_file,
-            client_token_environments,
+        write_client_tokens_sink(
+            sink_snapshot,
+            client_token_keys,
             client_tokens,
-            repository=arguments.repository,
         )
         try:
             write_state_file(arguments.state_file, rendered)
         except ResolutionError as state_error:
             try:
-                secret_file.unlink(missing_ok=True)
-            except OSError:
+                restore_secret_sink(sink_snapshot)
+            except (OSError, ResolutionError):
                 raise ResolutionError(
-                    "control-plane state persistence failed and the new client-token sink "
-                    "could not be rolled back; remove that sink before retrying"
+                    "control-plane state persistence failed and the client-token sink "
+                    "could not be restored; repair that sink before retrying"
                 ) from None
             raise state_error
         print(rendered)

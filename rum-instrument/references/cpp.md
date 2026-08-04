@@ -1,7 +1,6 @@
 # C++ adapter
 
-Official access guide: https://docs.guance.com/real-user-monitoring/cpp/app-access/
-Official source: https://github.com/GuanceCloud/datakit-cpp
+Primary-source registry: `official-sources.json#cpp`.
 
 ## Detect
 

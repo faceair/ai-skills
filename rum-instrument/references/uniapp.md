@@ -1,7 +1,6 @@
 # UniApp adapter
 
-Official access guide: https://docs.guance.com/real-user-monitoring/uni-app/app-access/
-Official native plugin source: https://github.com/GuanceCloud/datakit-uniapp-native-plugin
+Primary-source registry: `official-sources.json#uniapp`.
 
 ## Detect and route
 

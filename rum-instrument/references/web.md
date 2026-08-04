@@ -1,6 +1,6 @@
 # Web adapter
 
-Official access guide: https://docs.guance.com/real-user-monitoring/web/app-access/
+Primary-source registry: `official-sources.json#web`.
 
 ## Detect and route
 

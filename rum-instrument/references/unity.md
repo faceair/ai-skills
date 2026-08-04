@@ -1,11 +1,10 @@
 # Unity adapter
 
-Official access guide: https://docs.guance.com/real-user-monitoring/unity/app-access/
-Official source: https://github.com/GuanceCloud/datakit-unity
+Primary-source registry: `official-sources.json#unity`.
 
 ## Detect
 
-Confirm a Unity project from `ProjectSettings/ProjectVersion.txt`, `Packages/manifest.json`, Assets, scenes, and build settings. Detect Android/iOS release targets and existing Guance prefabs, bridge code, AAR/XCFramework content, or native SDK integrations.
+Confirm a Unity project from `ProjectSettings/ProjectVersion.txt`, `Packages/manifest.json`, Assets, scenes, and build settings. Detect Android/iOS release targets and existing RUM prefabs, bridge code, AAR/XCFramework content, or native SDK integrations.
 
 Use independent Android and iOS Application IDs. Do not treat `Assets/Plugins/Android` or `Assets/Plugins/iOS` as separate applications.
 

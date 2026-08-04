@@ -1,12 +1,12 @@
 # HarmonyOS adapter
 
-Official access guide: https://docs.guance.com/real-user-monitoring/harmonyos/app-access/
+Primary-source registry: `official-sources.json#harmonyos`.
 
 ## Detect
 
 Confirm HarmonyOS applications from `oh-package.json5`, `build-profile.json5`, module configuration, ArkTS entry abilities, products/build modes, and maintained HAR sources. Exclude `oh_modules` and generated build output.
 
-Inspect existing `@guancecloud/ft_sdk`, optional `@guancecloud/ft_sdk_ext`/`@guancecloud/ft_native`, legacy unscoped packages, `FTSDKConfig`, entry-ability initialization, HTTP interceptors, WebView, and symbol/native setup.
+Inspect the exact package candidates in the source registry, legacy unscoped packages, `FTSDKConfig`, entry-ability initialization, HTTP interceptors, WebView, and symbol/native setup.
 
 ## Plan
 
