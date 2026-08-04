@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import importlib.util
 from pathlib import Path
+import subprocess
+import tempfile
 import unittest
 
 
@@ -15,12 +18,11 @@ SPEC.loader.exec_module(VALIDATOR)
 
 def valid_plan():
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "repository": {
             "root": ".",
             "commit": "abc123",
             "initial_status": [],
-            "analysis_fingerprint": "fingerprint",
         },
         "request": {
             "intent": "plan",
@@ -32,18 +34,18 @@ def valid_plan():
                 "mode": "public_dataway",
                 "endpoint": {"source": "template:DATAWAY_URL"},
                 "client_tokens": {
-                    "web": {"source": "runtime:GUANCE_RUM_CLIENT_TOKEN"}
+                    "web": {
+                        "source": "runtime:GUANCE_RUM_CLIENT_TOKEN",
+                        "availability": "planned",
+                    }
                 },
                 "control_plane": {
-                    "status": "resolved",
+                    "status": "catalog_resolved",
                     "catalog": "https://urls.guance.com/",
                     "site_code": "cn3",
                     "ai_api_endpoint": {"value": "https://cn3-ai-api.guance.com"},
                     "exchange_path": "/api/v1/account/accesskey/exchange",
                     "application_lookup_path": "/api/v1/rum/app/get",
-                    "temporary_authorization_code": {
-                        "source": "env:GUANCE_TEMP_AUTH_CODE"
-                    },
                     "api_key_persistence": "memory_only",
                 },
             },
@@ -60,12 +62,27 @@ def valid_plan():
                 "application_types": {
                     "web": {
                         "value": "web",
-                        "source": "ai_api",
+                        "source": "repository",
                         "confidence": "high",
+                        "verification": "pending",
+                        "api_value": None,
                     }
                 },
-                "existing_instrumentation": {},
-                "profile": {},
+                "existing_instrumentation": {
+                    "status": "none",
+                    "files": [],
+                    "sdk": None,
+                    "version": None,
+                    "signals": [],
+                },
+                "profile": {
+                    "signals": {
+                        "rum": True,
+                        "logs": "preserve",
+                        "tracing": "preserve",
+                        "replay": False,
+                    }
+                },
                 "receiver_mapping": {},
                 "privacy": {},
                 "artifacts": {},
@@ -81,7 +98,17 @@ def valid_plan():
                 "order": 1,
                 "purpose": "Configure Browser RUM once",
                 "edits": ["Add the approved Browser RUM initializer"],
-                "dependency_decision": {"action": "preserve"},
+                "dependency_decision": {
+                    "action": "preserve",
+                    "package": "@cloudcare/browser-rum",
+                    "owner": "CloudCare",
+                    "version": "existing lockfile version",
+                    "official_sources": [
+                        "https://docs.guance.com/real-user-monitoring/web/app-access/"
+                    ],
+                    "compatibility": "preserve the repository-resolved version",
+                    "verified_at": "2026-08-04",
+                },
                 "validation": ["npm test"],
                 "risk": "The initializer could run too late",
                 "rollback": "Revert src/rum.ts",
@@ -90,16 +117,136 @@ def valid_plan():
         "validation": [],
         "risks": [],
         "handoff": [],
-        "approval": {"status": "pending", "revision": 1},
+        "approval": {
+            "status": "pending",
+            "basis": "plan_only_request",
+            "blockers": [],
+            "revision": 1,
+        },
     }
 
 
+def resolve_public_dataway(plan):
+    control_plane = plan["request"]["receiver"]["control_plane"]
+    control_plane["status"] = "resolved"
+    control_plane["temporary_authorization_code"] = {"source": "prompt:provided"}
+    for token in plan["request"]["receiver"].get("client_tokens", {}).values():
+        token["availability"] = "persisted"
+    for target in plan["targets"]:
+        for descriptor in target.get("application_types", {}).values():
+            descriptor["api_value"] = descriptor["value"]
+            descriptor["verification"] = "matched"
+
+
+def verified_datakit_readiness():
+    return {
+        "status": "verified",
+        "checks": {
+            "rum_collector": {
+                "status": "verified",
+                "evidence": ["DataKit /v1/write/rum collector probe passed"],
+                "handoff": [],
+            },
+            "network_reachability": {
+                "status": "verified",
+                "evidence": ["application runtime can reach the DataKit origin"],
+                "handoff": [],
+            },
+        },
+    }
+
+
+def approve_revision(plan):
+    plan["approval"].update(
+        {
+            "status": "approved",
+            "basis": "revision_review",
+            "blockers": [],
+            "reviewed_overlaps": [],
+        }
+    )
+    plan["approval"]["reviewed_plan_sha256"] = VALIDATOR.plan_review_digest(plan)
+
+
 class ValidateContractTests(unittest.TestCase):
+    def test_status_path_decodes_git_quoted_unicode(self):
+        self.assertEqual(
+            "src/监控 rum.ts",
+            VALIDATOR._status_path(
+                r' M "src/\347\233\221\346\216\247 rum.ts"'
+            ),
+        )
+
     def test_accepts_minimal_public_dataway_plan(self):
         errors, warnings = VALIDATOR.validate_plan(valid_plan(), "plan")
 
         self.assertEqual([], errors)
         self.assertEqual([], warnings)
+
+    def test_rejects_malformed_receiver_origin(self):
+        plan = valid_plan()
+        plan["request"]["receiver"]["endpoint"] = {
+            "value": "https://open way.guance.com"
+        }
+
+        errors, _ = VALIDATOR.validate_plan(plan, "plan")
+
+        self.assertTrue(any("must be an HTTP(S) origin" in error for error in errors))
+
+    def test_ai_api_endpoint_must_be_catalog_matched_literal(self):
+        plan = valid_plan()
+        plan["request"]["receiver"]["control_plane"]["ai_api_endpoint"] = {
+            "source": "runtime:AI_API_ENDPOINT"
+        }
+
+        errors, _ = VALIDATOR.validate_plan(plan, "plan")
+
+        self.assertTrue(
+            any("literal catalog-matched value" in error for error in errors)
+        )
+
+    def test_rejects_legacy_plan_schema(self):
+        plan = valid_plan()
+        plan["schema_version"] = 1
+
+        errors, _ = VALIDATOR.validate_plan(plan, "plan")
+
+        self.assertIn("schema_version must be 2", errors)
+
+    def test_resolved_control_plane_allows_discarded_code_and_requires_routed_token(self):
+        plan = valid_plan()
+        control_plane = plan["request"]["receiver"]["control_plane"]
+        control_plane["status"] = "resolved"
+        plan["request"]["receiver"]["client_tokens"]["web"][
+            "availability"
+        ] = "persisted"
+        descriptor = plan["targets"][0]["application_types"]["web"]
+        descriptor.update({"verification": "matched", "api_value": "web"})
+
+        errors, _ = VALIDATOR.validate_plan(plan, "plan")
+        self.assertEqual([], errors)
+
+        control_plane["temporary_authorization_code"] = {
+            "source": "prompt:provided"
+        }
+        errors, _ = VALIDATOR.validate_plan(plan, "plan")
+        self.assertEqual([], errors)
+
+    def test_catalog_status_rejects_persisted_token_availability(self):
+        plan = valid_plan()
+        plan["request"]["receiver"]["client_tokens"]["web"][
+            "availability"
+        ] = "persisted"
+
+        errors, _ = VALIDATOR.validate_plan(plan, "plan")
+
+        self.assertTrue(
+            any(
+                "availability must be planned or existing when control_plane.status=catalog_resolved"
+                in error
+                for error in errors
+            )
+        )
 
     def test_accepts_explicit_test_catalog_and_tls_exception(self):
         plan = valid_plan()
@@ -108,7 +255,7 @@ class ValidateContractTests(unittest.TestCase):
             {
                 "catalog": "testing_override",
                 "catalog_source": {
-                    "source": "existing:user-provided-testing-catalog"
+                    "source": "existing:evals/files/test-site-catalog.json#testing"
                 },
                 "site_code": "testing",
                 "ai_api_endpoint": {
@@ -153,7 +300,7 @@ class ValidateContractTests(unittest.TestCase):
             {
                 "catalog": "testing_override",
                 "catalog_source": {
-                    "source": "existing:user-provided-testing-catalog"
+                    "source": "existing:evals/files/test-site-catalog.json#testing"
                 },
                 "test_only": True,
                 "tls_verification": "disabled_for_testing",
@@ -167,15 +314,341 @@ class ValidateContractTests(unittest.TestCase):
 
         self.assertTrue(any("must be an HTTPS origin" in error for error in errors))
 
-    def test_requires_approved_revision_for_implementation(self):
+    def test_plan_only_request_requires_revision_review_for_implementation(self):
         errors, _ = VALIDATOR.validate_plan(valid_plan(), "implement")
 
         self.assertIn("implementation requires approval.status=approved", errors)
 
         plan = valid_plan()
-        plan["approval"]["status"] = "approved"
+        resolve_public_dataway(plan)
+        approve_revision(plan)
         errors, _ = VALIDATOR.validate_plan(plan, "implement")
         self.assertEqual([], errors)
+
+    def test_explicit_implementation_request_is_pre_authorized(self):
+        plan = valid_plan()
+        plan["request"]["intent"] = "implement"
+        plan["approval"].update(
+            {
+                "status": "approved",
+                "basis": "explicit_implementation_request",
+            }
+        )
+        resolve_public_dataway(plan)
+
+        errors, _ = VALIDATOR.validate_plan(plan, "implement")
+
+        self.assertEqual([], errors)
+
+    def test_rejects_inconsistent_approval_status_and_basis(self):
+        plan = valid_plan()
+        plan["approval"]["basis"] = "revision_review"
+
+        errors, _ = VALIDATOR.validate_plan(plan, "plan")
+
+        self.assertIn(
+            "approval.basis=revision_review requires approval.status=approved",
+            errors,
+        )
+
+        plan["approval"].update(
+            {
+                "status": "approved",
+                "basis": "plan_only_request",
+            }
+        )
+        errors, _ = VALIDATOR.validate_plan(plan, "plan")
+        self.assertIn(
+            "approval.basis=plan_only_request requires approval.status=pending",
+            errors,
+        )
+
+    def test_explicit_implementation_request_pauses_when_blocked(self):
+        plan = valid_plan()
+        plan["request"]["intent"] = "implement"
+        plan["targets"][0]["disposition"] = "blocked"
+        plan["targets"][0]["blockers"] = ["Application type mismatch requires review"]
+        plan["request"]["receiver"]["client_tokens"] = {}
+        plan["planned_changes"] = []
+        plan["approval"].update(
+            {
+                "status": "pending",
+                "basis": "explicit_implementation_request",
+                "blockers": ["Application type mismatch requires review"],
+            }
+        )
+
+        plan_errors, _ = VALIDATOR.validate_plan(plan, "plan")
+        implementation_errors, _ = VALIDATOR.validate_plan(plan, "implement")
+
+        self.assertEqual([], plan_errors)
+        self.assertIn(
+            "implementation requires approval.status=approved",
+            implementation_errors,
+        )
+        self.assertTrue(
+            any(
+                "implementation cannot start while blockers remain" in error
+                for error in implementation_errors
+            )
+        )
+
+    def test_material_risk_requires_revision_review(self):
+        plan = valid_plan()
+        plan["request"]["intent"] = "implement"
+        plan["approval"].update(
+            {
+                "status": "approved",
+                "basis": "explicit_implementation_request",
+            }
+        )
+        plan["planned_changes"][0]["dependency_decision"]["action"] = "upgrade"
+
+        errors, _ = VALIDATOR.validate_plan(plan, "plan")
+
+        self.assertTrue(
+            any(
+                "explicit implementation authorization cannot cover material-risk changes"
+                in error
+                for error in errors
+            )
+        )
+
+        resolve_public_dataway(plan)
+        approve_revision(plan)
+        errors, _ = VALIDATOR.validate_plan(plan, "implement")
+        self.assertEqual([], errors)
+
+    def test_new_optional_signal_requires_revision_review(self):
+        plan = valid_plan()
+        plan["request"]["intent"] = "implement"
+        plan["approval"].update(
+            {
+                "status": "approved",
+                "basis": "explicit_implementation_request",
+            }
+        )
+        plan["targets"][0]["profile"]["signals"]["replay"] = True
+
+        errors, _ = VALIDATOR.validate_plan(plan, "plan")
+
+        self.assertTrue(
+            any(
+                "new optional signal replay" in error
+                for error in errors
+            )
+        )
+
+        plan["approval"].update(
+            {
+                "status": "pending",
+                "basis": "explicit_implementation_request",
+                "blockers": ["New Session Replay scope requires review"],
+            }
+        )
+        errors, _ = VALIDATOR.validate_plan(plan, "plan")
+        self.assertEqual([], errors)
+
+        resolve_public_dataway(plan)
+        approve_revision(plan)
+        errors, _ = VALIDATOR.validate_plan(plan, "implement")
+        self.assertEqual([], errors)
+
+    def test_native_crash_signal_requires_revision_review(self):
+        plan = valid_plan()
+        plan["request"]["intent"] = "implement"
+        plan["approval"].update(
+            {
+                "status": "approved",
+                "basis": "explicit_implementation_request",
+            }
+        )
+        plan["targets"][0]["profile"]["signals"]["native_crash"] = True
+
+        errors, _ = VALIDATOR.validate_plan(plan, "plan")
+
+        self.assertTrue(
+            any("new optional signal native_crash" in error for error in errors)
+        )
+
+    def test_rejects_unknown_signal_and_recursive_decision_object(self):
+        plan = valid_plan()
+        plan["targets"][0]["profile"]["signals"]["performance_magic"] = {
+            "nested": {"enabled": True}
+        }
+
+        errors, _ = VALIDATOR.validate_plan(plan, "plan")
+
+        self.assertTrue(any("is not a supported signal" in error for error in errors))
+
+        plan = valid_plan()
+        plan["targets"][0]["existing_instrumentation"]["signals"] = [
+            "performance_magic"
+        ]
+        errors, _ = VALIDATOR.validate_plan(plan, "plan")
+        self.assertTrue(any("contains unsupported signal" in error for error in errors))
+
+    def test_planned_target_requires_core_rum(self):
+        plan = valid_plan()
+        plan["targets"][0]["profile"]["signals"]["rum"] = False
+
+        errors, _ = VALIDATOR.validate_plan(plan, "plan")
+
+        self.assertTrue(
+            any("profile.signals.rum must be enabled" in error for error in errors)
+        )
+
+    def test_rejects_contradictory_artifact_controls(self):
+        plan = valid_plan()
+        plan["targets"][0]["artifacts"]["sourcemaps"] = {
+            "status": "existing",
+            "upload": True,
+        }
+
+        errors, _ = VALIDATOR.validate_plan(plan, "plan")
+
+        self.assertTrue(
+            any("exactly one status or action control field" in error for error in errors)
+        )
+
+        plan = valid_plan()
+        plan["targets"][0]["profile"]["signals"]["replay"] = {"status": True}
+        plan["targets"][0]["artifacts"]["sourcemaps"] = {"action": True}
+        errors, _ = VALIDATOR.validate_plan(plan, "plan")
+        self.assertGreaterEqual(
+            sum("status must be a non-empty string" in error for error in errors),
+            2,
+        )
+
+    def test_application_type_mismatch_requires_revision_review(self):
+        plan = valid_plan()
+        plan["request"]["intent"] = "implement"
+        plan["approval"].update(
+            {
+                "status": "approved",
+                "basis": "explicit_implementation_request",
+            }
+        )
+        descriptor = plan["targets"][0]["application_types"]["web"]
+        descriptor.update(
+            {
+                "value": "web",
+                "source": "user",
+                "verification": "mismatched",
+                "api_value": "custom",
+            }
+        )
+
+        errors, _ = VALIDATOR.validate_plan(plan, "plan")
+
+        self.assertTrue(
+            any("user application type differs from AI API" in error for error in errors)
+        )
+
+    def test_revision_review_digest_binds_exact_plan(self):
+        plan = valid_plan()
+        resolve_public_dataway(plan)
+        approve_revision(plan)
+
+        errors, _ = VALIDATOR.validate_plan(plan, "plan")
+        self.assertEqual([], errors)
+
+        plan["planned_changes"][0]["purpose"] = "A different change after review"
+        errors, _ = VALIDATOR.validate_plan(plan, "plan")
+        self.assertTrue(
+            any("reviewed_plan_sha256 does not match" in error for error in errors)
+        )
+
+    def test_existing_optional_signal_does_not_require_revision_review(self):
+        plan = valid_plan()
+        plan["request"]["intent"] = "implement"
+        plan["approval"].update(
+            {
+                "status": "approved",
+                "basis": "explicit_implementation_request",
+            }
+        )
+        plan["targets"][0]["existing_instrumentation"]["signals"] = ["replay"]
+        plan["targets"][0]["profile"]["signals"]["replay"] = True
+        resolve_public_dataway(plan)
+
+        errors, _ = VALIDATOR.validate_plan(plan, "implement")
+
+        self.assertEqual([], errors)
+
+    def test_new_release_artifact_requires_revision_review(self):
+        plan = valid_plan()
+        plan["request"]["intent"] = "implement"
+        plan["approval"].update(
+            {
+                "status": "approved",
+                "basis": "explicit_implementation_request",
+            }
+        )
+        plan["targets"][0]["artifacts"] = {
+            "sourcemaps": {"action": "generate"}
+        }
+
+        errors, _ = VALIDATOR.validate_plan(plan, "plan")
+
+        self.assertTrue(
+            any(
+                "new release artifact scope sourcemaps" in error
+                for error in errors
+            )
+        )
+
+    def test_existing_release_artifact_does_not_require_revision_review(self):
+        plan = valid_plan()
+        plan["request"]["intent"] = "implement"
+        plan["approval"].update(
+            {
+                "status": "approved",
+                "basis": "explicit_implementation_request",
+            }
+        )
+        plan["targets"][0]["artifacts"] = {
+            "sourcemaps": {
+                "status": "existing",
+                "path": "dist/assets/*.map",
+            }
+        }
+        resolve_public_dataway(plan)
+
+        errors, _ = VALIDATOR.validate_plan(plan, "implement")
+
+        self.assertEqual([], errors)
+
+    def test_testing_override_requires_revision_review(self):
+        plan = valid_plan()
+        plan["request"]["intent"] = "implement"
+        plan["approval"].update(
+            {
+                "status": "approved",
+                "basis": "explicit_implementation_request",
+            }
+        )
+        control_plane = plan["request"]["receiver"]["control_plane"]
+        control_plane.update(
+            {
+                "catalog": "testing_override",
+                "catalog_source": {
+                    "source": "existing:evals/files/test-site-catalog.json#testing"
+                },
+                "site_code": "testing",
+                "ai_api_endpoint": {
+                    "value": "https://testing-ft2x-ai-api.dataflux.cn"
+                },
+                "test_only": True,
+                "tls_verification": "disabled_for_testing",
+            }
+        )
+
+        errors, _ = VALIDATOR.validate_plan(plan, "plan")
+
+        self.assertTrue(
+            any("testing control-plane override" in error for error in errors)
+        )
 
     def test_rejects_empty_changes_for_a_planned_target(self):
         plan = valid_plan()
@@ -210,6 +683,41 @@ class ValidateContractTests(unittest.TestCase):
         self.assertTrue(any(".dependency_decision.action" in error for error in errors))
         self.assertTrue(any("has no planned change" in error for error in errors))
 
+    def test_rejects_repository_control_paths(self):
+        plan = valid_plan()
+        plan["planned_changes"][0]["file"] = ".git/hooks/post-checkout"
+
+        errors, _ = VALIDATOR.validate_plan(plan, "plan")
+
+        self.assertTrue(
+            any("repository control directory" in error for error in errors)
+        )
+
+        plan["planned_changes"][0]["file"] = ".github/skills/rum/SKILL.md"
+        errors, _ = VALIDATOR.validate_plan(plan, "plan")
+        self.assertTrue(
+            any("Agent Skill control directory" in error for error in errors)
+        )
+
+    def test_dependency_add_requires_complete_provenance(self):
+        plan = valid_plan()
+        plan["planned_changes"][0]["dependency_decision"] = {"action": "add"}
+
+        errors, _ = VALIDATOR.validate_plan(plan, "plan")
+
+        for field in (
+            "package",
+            "owner",
+            "version",
+            "official_sources",
+            "compatibility",
+            "verified_at",
+        ):
+            self.assertTrue(
+                any(f"dependency_decision.{field}" in error for error in errors),
+                field,
+            )
+
     def test_rejects_client_token_value(self):
         plan = valid_plan()
         plan["request"]["receiver"]["client_tokens"]["web"] = {
@@ -221,6 +729,21 @@ class ValidateContractTests(unittest.TestCase):
         self.assertTrue(any("client_token" in error for error in errors))
         self.assertTrue(any("never contain a value" in error for error in errors))
 
+    def test_rejects_client_token_literal_disguised_as_runtime_reference(self):
+        plan = valid_plan()
+        plan["request"]["receiver"]["client_tokens"]["web"]["source"] = (
+            "runtime:synthetic-client-token-literal"
+        )
+
+        errors, _ = VALIDATOR.validate_plan(plan, "plan")
+
+        self.assertTrue(
+            any(
+                "structured env, existing, or runtime reference" in error
+                for error in errors
+            )
+        )
+
     def test_rejects_user_supplied_client_token_template(self):
         plan = valid_plan()
         plan["request"]["receiver"]["client_tokens"]["web"] = {
@@ -229,7 +752,43 @@ class ValidateContractTests(unittest.TestCase):
 
         errors, _ = VALIDATOR.validate_plan(plan, "plan")
 
-        self.assertTrue(any("control-plane flow" in error for error in errors))
+        self.assertTrue(any("env, existing, or runtime" in error for error in errors))
+
+    def test_rejects_prompt_provided_client_token(self):
+        plan = valid_plan()
+        plan["request"]["receiver"]["client_tokens"]["web"] = {
+            "source": "prompt:provided"
+        }
+
+        errors, _ = VALIDATOR.validate_plan(plan, "plan")
+
+        self.assertTrue(any("env, existing, or runtime" in error for error in errors))
+
+    def test_rejects_prompt_provided_marker_for_nested_client_token(self):
+        plan = valid_plan()
+        plan["targets"][0]["receiver_mapping"] = {
+            "clientToken": {"source": "prompt:provided"}
+        }
+
+        errors, _ = VALIDATOR.validate_plan(plan, "plan")
+
+        self.assertTrue(
+            any(
+                "receiver_mapping.clientToken must contain only a non-secret source reference"
+                in error
+                for error in errors
+            )
+        )
+
+    def test_rejects_authorization_code_embedded_in_prompt_reference(self):
+        plan = valid_plan()
+        plan["request"]["receiver"]["control_plane"]["temporary_authorization_code"] = {
+            "source": "prompt:synthetic-temporary-code"
+        }
+
+        errors, _ = VALIDATOR.validate_plan(plan, "plan")
+
+        self.assertTrue(any("prompt:provided" in error for error in errors))
 
     def test_rejects_temporary_authorization_code_value_without_echoing_it(self):
         plan = valid_plan()
@@ -322,11 +881,15 @@ class ValidateContractTests(unittest.TestCase):
                 "value": "android",
                 "source": "ai_api",
                 "confidence": "high",
+                "verification": "pending",
+                "api_value": None,
             },
             "ios": {
                 "value": "ios",
                 "source": "ai_api",
                 "confidence": "high",
+                "verification": "pending",
+                "api_value": None,
             },
         }
 
@@ -336,6 +899,7 @@ class ValidateContractTests(unittest.TestCase):
         target["disposition"] = "blocked"
         target["blockers"] = ["Missing Application ID slot: ios"]
         plan["planned_changes"] = []
+        plan["request"]["receiver"]["client_tokens"] = {}
         errors, warnings = VALIDATOR.validate_plan(plan, "plan")
         self.assertEqual([], errors)
         self.assertTrue(any("slot ios" in warning for warning in warnings))
@@ -345,23 +909,59 @@ class ValidateContractTests(unittest.TestCase):
         plan["request"]["receiver"] = {
             "mode": "datakit",
             "endpoint": {"source": "template:DATAKIT_URL"},
+            "readiness": verified_datakit_readiness(),
         }
-        plan["targets"][0]["application_types"]["web"]["source"] = "repository"
+        plan["targets"][0]["application_types"]["web"].update(
+            {
+                "source": "repository",
+                "verification": "not_applicable",
+                "api_value": None,
+            }
+        )
 
         errors, _ = VALIDATOR.validate_plan(plan, "plan")
 
         self.assertEqual([], errors)
 
-    def test_rejects_removed_headless_mode(self):
+    def test_datakit_unknown_readiness_blocks_implementation(self):
         plan = valid_plan()
+        plan["request"]["intent"] = "implement"
         plan["request"]["receiver"] = {
-            "mode": "headless",
-            "endpoint": {"source": "template:HEADLESS_URL"},
+            "mode": "datakit",
+            "endpoint": {"source": "template:DATAKIT_URL"},
+            "readiness": {
+                "status": "unknown",
+                "checks": {
+                    check: {
+                        "status": "unknown",
+                        "evidence": [],
+                        "handoff": [f"Verify {check} before implementation"],
+                    }
+                    for check in ("rum_collector", "network_reachability")
+                },
+            },
         }
+        plan["targets"][0]["application_types"]["web"].update(
+            {
+                "verification": "not_applicable",
+                "api_value": None,
+            }
+        )
+        plan["approval"].update(
+            {
+                "status": "pending",
+                "basis": "explicit_implementation_request",
+                "blockers": ["Verify DataKit receiver readiness"],
+            }
+        )
 
-        errors, _ = VALIDATOR.validate_plan(plan, "plan")
+        plan_errors, _ = VALIDATOR.validate_plan(plan, "plan")
+        implementation_errors, _ = VALIDATOR.validate_plan(plan, "implement")
 
-        self.assertTrue(any("headless is no longer supported" in error for error in errors))
+        self.assertEqual([], plan_errors)
+        self.assertTrue(
+            any("DataKit readiness is unknown" in error for error in implementation_errors)
+        )
 
     def test_datakit_rejects_public_control_plane_fields(self):
         plan = valid_plan()
@@ -407,11 +1007,15 @@ class ValidateContractTests(unittest.TestCase):
                 "value": "android",
                 "source": "ai_api",
                 "confidence": "high",
+                "verification": "pending",
+                "api_value": None,
             },
             "ios": {
                 "value": "ios",
                 "source": "ai_api",
                 "confidence": "high",
+                "verification": "pending",
+                "api_value": None,
             },
         }
 
@@ -434,6 +1038,12 @@ class ValidateContractTests(unittest.TestCase):
         second["disposition"] = "blocked"
         second["blockers"] = ["Missing Application ID slot: web"]
         plan["targets"].append(second)
+        plan["request"]["receiver"]["client_tokens"] = {
+            "web": {
+                "source": "runtime:GUANCE_RUM_CLIENT_TOKEN",
+                "availability": "planned",
+            }
+        }
 
         errors, _ = VALIDATOR.validate_plan(plan, "plan")
 
@@ -453,11 +1063,474 @@ class ValidateContractTests(unittest.TestCase):
         second["path"] = "apps/portal"
         plan["targets"].append(second)
         plan["planned_changes"] = []
+        plan["request"]["receiver"]["client_tokens"] = {}
 
         errors, warnings = VALIDATOR.validate_plan(plan, "plan")
 
         self.assertEqual([], errors)
         self.assertTrue(any("scalar Application ID input remains unassigned" in warning for warning in warnings))
+
+    def test_rejects_client_token_slot_that_does_not_match_active_target(self):
+        plan = valid_plan()
+        plan["request"]["receiver"]["client_tokens"] = {
+            "wrong": {
+                "source": "runtime:GUANCE_RUM_CLIENT_TOKEN_WRONG",
+                "availability": "planned",
+            }
+        }
+
+        errors, _ = VALIDATOR.validate_plan(plan, "plan")
+
+        self.assertTrue(any("missing active Application ID slots: web" in error for error in errors))
+        self.assertTrue(any("unknown or blocked slots: wrong" in error for error in errors))
+
+    def test_blocked_control_plane_allows_no_client_tokens(self):
+        plan = valid_plan()
+        plan["request"]["receiver"].pop("client_tokens")
+        plan["request"]["receiver"]["control_plane"] = {
+            "status": "blocked",
+            "api_key_persistence": "memory_only",
+            "blockers": ["Public DataWay site is not in an approved catalog"],
+        }
+        plan["targets"][0]["disposition"] = "blocked"
+        plan["targets"][0]["blockers"] = ["Receiver resolution is blocked"]
+        plan["planned_changes"] = []
+
+        errors, _ = VALIDATOR.validate_plan(plan, "plan")
+
+        self.assertEqual([], errors)
+
+    def test_rejects_duplicate_active_slot_names_across_targets(self):
+        plan = valid_plan()
+        second = copy.deepcopy(plan["targets"][0])
+        second["id"] = "web:apps/portal"
+        second["path"] = "apps/portal"
+        second["application_ids"]["web"] = {"source": "template:PORTAL_APP_ID"}
+        plan["targets"].append(second)
+        second_change = copy.deepcopy(plan["planned_changes"][0])
+        second_change["target_id"] = second["id"]
+        second_change["file"] = "apps/portal/src/rum.ts"
+        second_change["order"] = 2
+        plan["planned_changes"].append(second_change)
+
+        errors, _ = VALIDATOR.validate_plan(plan, "plan")
+
+        self.assertTrue(any("target-specific slot names" in error for error in errors))
+
+    def test_public_dataway_cpp_target_must_be_blocked(self):
+        plan = valid_plan()
+        target = plan["targets"][0]
+        target.update(
+            {
+                "id": "cpp:apps/desktop",
+                "path": "apps/desktop",
+                "platform": "cpp",
+                "variants": ["windows-linux"],
+                "application_id_slots": ["cpp"],
+                "application_ids": {
+                    "cpp": {"source": "template:APP_ID"}
+                },
+                "application_types": {
+                    "cpp": {
+                        "value": "custom",
+                        "source": "repository",
+                        "confidence": "high",
+                        "verification": "pending",
+                        "api_value": None,
+                    }
+                },
+            }
+        )
+        plan["planned_changes"][0]["target_id"] = target["id"]
+        plan["planned_changes"][0]["file"] = "apps/desktop/src/rum.cpp"
+        plan["request"]["receiver"]["client_tokens"] = {
+            "cpp": {
+                "source": "runtime:GUANCE_RUM_CLIENT_TOKEN_CPP",
+                "availability": "planned",
+            }
+        }
+
+        errors, _ = VALIDATOR.validate_plan(plan, "plan")
+
+        self.assertTrue(
+            any("current C++ adapter supports only DataKit" in error for error in errors)
+        )
+
+        target["disposition"] = "blocked"
+        target["blockers"] = ["C++ Public DataWay is unsupported; provide datakitUrl"]
+        plan["planned_changes"] = []
+        plan["request"]["receiver"]["client_tokens"] = {}
+        errors, _ = VALIDATOR.validate_plan(plan, "plan")
+        self.assertEqual([], errors)
+
+    def test_datakit_cpp_target_is_supported(self):
+        plan = valid_plan()
+        receiver = plan["request"]["receiver"]
+        receiver["mode"] = "datakit"
+        receiver.pop("client_tokens")
+        receiver.pop("control_plane")
+        receiver["readiness"] = verified_datakit_readiness()
+        target = plan["targets"][0]
+        target.update(
+            {
+                "id": "cpp:.",
+                "platform": "cpp",
+                "variants": ["windows-linux"],
+                "application_id_slots": ["cpp"],
+                "application_ids": {
+                    "cpp": {"source": "template:APP_ID"}
+                },
+                "application_types": {
+                    "cpp": {
+                        "value": "custom",
+                        "source": "repository",
+                        "confidence": "high",
+                        "verification": "not_applicable",
+                        "api_value": None,
+                    }
+                },
+            }
+        )
+        plan["planned_changes"][0]["target_id"] = "cpp:."
+        plan["planned_changes"][0]["file"] = "src/rum.cpp"
+
+        errors, _ = VALIDATOR.validate_plan(plan, "plan")
+
+        self.assertEqual([], errors)
+
+    def test_macos_application_type_is_custom(self):
+        plan = valid_plan()
+        target = plan["targets"][0]
+        target.update(
+            {
+                "id": "apple:.",
+                "platform": "apple",
+                "variants": ["macos"],
+                "application_id_slots": ["macos"],
+                "application_ids": {
+                    "macos": {"source": "template:APP_ID"}
+                },
+                "application_types": {
+                    "macos": {
+                        "value": "ios",
+                        "source": "repository",
+                        "confidence": "high",
+                        "verification": "pending",
+                        "api_value": None,
+                    }
+                },
+            }
+        )
+        plan["planned_changes"][0]["target_id"] = "apple:."
+        plan["planned_changes"][0]["file"] = "Sources/main.swift"
+        plan["request"]["receiver"]["client_tokens"] = {
+            "macos": {
+                "source": "runtime:GUANCE_RUM_CLIENT_TOKEN_MACOS",
+                "availability": "planned",
+            }
+        }
+
+        errors, _ = VALIDATOR.validate_plan(plan, "plan")
+        self.assertTrue(
+            any("must be custom for the declared Apple variant" in error for error in errors)
+        )
+
+        target["application_types"]["macos"]["value"] = "custom"
+        errors, _ = VALIDATOR.validate_plan(plan, "plan")
+        self.assertEqual([], errors)
+
+    def test_validates_final_inventory_and_rejects_planned_token(self):
+        inventory = {
+            "schema_version": 1,
+            "generated_from_plan_revision": 2,
+            "repository": {"root": ".", "commit": "abc123"},
+            "receiver": {
+                "mode": "public_dataway",
+                "endpoint": {"source": "env:DATAWAY_URL"},
+                "client_tokens": {
+                    "web": {
+                        "source": "runtime:GUANCE_RUM_CLIENT_TOKEN",
+                        "availability": "persisted",
+                    }
+                },
+            },
+            "targets": [
+                {
+                    "id": "web:.",
+                    "path": ".",
+                    "platform": "web",
+                    "variants": ["browser"],
+                    "evidence": ["src/rum.ts"],
+                    "disposition": "instrumented",
+                    "application_id_slots": ["web"],
+                    "application_ids": {
+                        "web": {"source": "env:RUM_APPLICATION_ID"}
+                    },
+                    "application_types": {
+                        "web": {
+                            "value": "web",
+                            "source": "repository",
+                            "confidence": "high",
+                            "verification": "matched",
+                            "api_value": "web",
+                        }
+                    },
+                }
+            ],
+            "validation": ["npm test: passed"],
+            "artifacts": [],
+            "remote_verification": {"verified": False, "evidence": []},
+            "handoff": [],
+        }
+
+        errors, _ = VALIDATOR.validate_inventory(inventory)
+        self.assertEqual([], errors)
+
+        inventory["receiver"]["client_tokens"]["web"]["availability"] = "planned"
+        errors, _ = VALIDATOR.validate_inventory(inventory)
+        self.assertTrue(any("existing or persisted" in error for error in errors))
+
+        inventory["receiver"]["client_tokens"]["web"]["availability"] = "persisted"
+        duplicate = copy.deepcopy(inventory["targets"][0])
+        duplicate["id"] = "web:apps/portal"
+        duplicate["path"] = "apps/portal"
+        duplicate["application_id_slots"] = ["portal_web"]
+        duplicate["application_ids"] = {
+            "portal_web": {"source": "env:RUM_APPLICATION_ID"}
+        }
+        duplicate["application_types"] = {
+            "portal_web": {
+                "value": "web",
+                "source": "repository",
+                "confidence": "high",
+                "verification": "matched",
+                "api_value": "web",
+            }
+        }
+        inventory["targets"].append(duplicate)
+        inventory["receiver"]["client_tokens"]["portal_web"] = {
+            "source": "runtime:GUANCE_RUM_CLIENT_TOKEN_PORTAL",
+            "availability": "persisted",
+        }
+        errors, _ = VALIDATOR.validate_inventory(inventory)
+        self.assertTrue(
+            any("reuses the Application ID reference" in error for error in errors)
+        )
+
+    def test_inventory_requires_target_evidence_types_and_validation(self):
+        inventory = {
+            "schema_version": 1,
+            "generated_from_plan_revision": 1,
+            "repository": {"root": ".", "commit": "abc123"},
+            "receiver": {
+                "mode": "datakit",
+                "endpoint": {"source": "env:DATAKIT_URL"},
+                "readiness": verified_datakit_readiness(),
+            },
+            "targets": [
+                {
+                    "id": "web:.",
+                    "path": ".",
+                    "platform": "web",
+                    "variants": ["browser"],
+                    "evidence": [],
+                    "disposition": "instrumented",
+                    "application_id_slots": ["web"],
+                    "application_ids": {
+                        "web": {"source": "env:RUM_APPLICATION_ID"}
+                    },
+                }
+            ],
+            "validation": [],
+            "artifacts": [],
+            "remote_verification": {"verified": False, "evidence": []},
+            "handoff": [],
+        }
+
+        errors, _ = VALIDATOR.validate_inventory(inventory)
+
+        self.assertTrue(any("evidence must not be empty" in error for error in errors))
+        self.assertTrue(any("application_types must be an object" in error for error in errors))
+        self.assertTrue(any("validation must be a non-empty array" in error for error in errors))
+
+    def test_repository_state_rejects_commit_drift_and_dirty_planned_file(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            repository = Path(temporary)
+            subprocess.run(["git", "init", "-q", str(repository)], check=True)
+            subprocess.run(
+                ["git", "-C", str(repository), "config", "user.email", "test@example.com"],
+                check=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(repository), "config", "user.name", "Test"],
+                check=True,
+            )
+            (repository / "src").mkdir()
+            (repository / "src" / "rum.ts").write_text("export {}\n", encoding="utf-8")
+            (repository / "package.json").write_text("{}\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(repository), "add", "."], check=True)
+            subprocess.run(
+                ["git", "-C", str(repository), "commit", "-qm", "baseline"],
+                check=True,
+            )
+            commit = subprocess.run(
+                ["git", "-C", str(repository), "rev-parse", "HEAD"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            plan = valid_plan()
+            plan["repository"]["commit"] = commit
+
+            self.assertEqual(
+                [],
+                VALIDATOR.validate_repository_state(plan, repository),
+            )
+
+            (repository / "src" / "rum.ts").write_text(
+                "export const changed = true\n",
+                encoding="utf-8",
+            )
+            errors = VALIDATOR.validate_repository_state(plan, repository)
+            self.assertTrue(
+                any("planned files have unreviewed uncommitted changes" in error for error in errors)
+            )
+
+    def test_repository_state_handles_unicode_and_space_paths(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            repository = Path(temporary)
+            subprocess.run(["git", "init", "-q", str(repository)], check=True)
+            subprocess.run(
+                ["git", "-C", str(repository), "config", "user.email", "test@example.com"],
+                check=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(repository), "config", "user.name", "Test"],
+                check=True,
+            )
+            planned_path = "src/监控 rum.ts"
+            source = repository / planned_path
+            source.parent.mkdir()
+            source.write_text("export {}\n", encoding="utf-8")
+            (repository / "package.json").write_text("{}\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(repository), "add", "."], check=True)
+            subprocess.run(
+                ["git", "-C", str(repository), "commit", "-qm", "baseline"],
+                check=True,
+            )
+            commit = subprocess.run(
+                ["git", "-C", str(repository), "rev-parse", "HEAD"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            plan = valid_plan()
+            plan["repository"]["commit"] = commit
+            plan["planned_changes"][0]["file"] = planned_path
+            source.write_text("export const changed = true\n", encoding="utf-8")
+
+            errors = VALIDATOR.validate_repository_state(plan, repository)
+
+            self.assertTrue(
+                any(
+                    "planned files have unreviewed uncommitted changes" in error
+                    for error in errors
+                )
+            )
+
+    def test_revision_review_can_bind_a_preexisting_dirty_planned_file(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            repository = Path(temporary)
+            subprocess.run(["git", "init", "-q", str(repository)], check=True)
+            subprocess.run(
+                ["git", "-C", str(repository), "config", "user.email", "test@example.com"],
+                check=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(repository), "config", "user.name", "Test"],
+                check=True,
+            )
+            source = repository / "src" / "rum.ts"
+            source.parent.mkdir()
+            source.write_text("export {}\n", encoding="utf-8")
+            (repository / "package.json").write_text("{}\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(repository), "add", "."], check=True)
+            subprocess.run(
+                ["git", "-C", str(repository), "commit", "-qm", "baseline"],
+                check=True,
+            )
+            commit = subprocess.run(
+                ["git", "-C", str(repository), "rev-parse", "HEAD"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            source.write_text("export const userChange = true\n", encoding="utf-8")
+            digest = "sha256:" + hashlib.sha256(source.read_bytes()).hexdigest()
+            plan = valid_plan()
+            plan["repository"].update(
+                {
+                    "commit": commit,
+                    "initial_status": [" M src/rum.ts"],
+                }
+            )
+            plan["approval"].update(
+                {
+                    "basis": "revision_review",
+                    "reviewed_overlaps": [
+                        {"file": "src/rum.ts", "sha256": digest}
+                    ],
+                }
+            )
+
+            self.assertEqual(
+                [],
+                VALIDATOR.validate_repository_state(plan, repository),
+            )
+
+            source.write_text("export const changedAfterReview = true\n", encoding="utf-8")
+            errors = VALIDATOR.validate_repository_state(plan, repository)
+            self.assertTrue(
+                any("changed after approval" in error for error in errors)
+            )
+
+    def test_repository_state_rejects_symlinked_planned_file(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            repository = Path(temporary) / "repository"
+            outside = Path(temporary) / "outside.ts"
+            repository.mkdir()
+            subprocess.run(["git", "init", "-q", str(repository)], check=True)
+            subprocess.run(
+                ["git", "-C", str(repository), "config", "user.email", "test@example.com"],
+                check=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(repository), "config", "user.name", "Test"],
+                check=True,
+            )
+            outside.write_text("export {}\n", encoding="utf-8")
+            (repository / "src").mkdir()
+            (repository / "src" / "rum.ts").symlink_to(outside)
+            (repository / "package.json").write_text("{}\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(repository), "add", "."], check=True)
+            subprocess.run(
+                ["git", "-C", str(repository), "commit", "-qm", "baseline"],
+                check=True,
+            )
+            commit = subprocess.run(
+                ["git", "-C", str(repository), "rev-parse", "HEAD"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            plan = valid_plan()
+            plan["repository"]["commit"] = commit
+
+            errors = VALIDATOR.validate_repository_state(plan, repository)
+
+            self.assertTrue(
+                any("traverses a symlink" in error for error in errors)
+            )
 
 
 if __name__ == "__main__":

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
+import getpass
 import json
 import os
 from pathlib import Path
@@ -12,6 +13,7 @@ import re
 import ssl
 import subprocess
 import sys
+import time
 from typing import Any, Callable
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
@@ -60,6 +62,7 @@ class Site:
 
 JsonFetcher = Callable[[str], dict[str, Any]]
 JsonPoster = Callable[[str, dict[str, str], dict[str, str], str], dict[str, Any]]
+Sleeper = Callable[[float], None]
 
 
 def normalize_origin(value: str, field: str) -> str:
@@ -68,6 +71,15 @@ def normalize_origin(value: str, field: str) -> str:
     parsed = urlsplit(value.strip())
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
         raise ResolutionError(f"{field} must be an absolute http(s) URL")
+    try:
+        parsed.port
+    except ValueError:
+        raise ResolutionError(f"{field} contains an invalid port") from None
+    if parsed.hostname is None or any(
+        character.isspace() or ord(character) < 32
+        for character in parsed.netloc
+    ):
+        raise ResolutionError(f"{field} contains an invalid host")
     if parsed.username or parsed.password:
         raise ResolutionError(f"{field} must not contain URL credentials")
     if parsed.query or parsed.fragment:
@@ -336,6 +348,9 @@ def resolve_applications(
     *,
     user_application_types: dict[str, str] | None = None,
     json_poster: JsonPoster = post_json,
+    lookup_attempts: int = 3,
+    retry_delay: float = 1.0,
+    sleeper: Sleeper = time.sleep,
 ) -> tuple[dict[str, Any], dict[str, str]]:
     if not isinstance(application_ids, dict) or not application_ids:
         raise ResolutionError("at least one appId is required")
@@ -348,7 +363,10 @@ def resolve_applications(
         ):
             raise ResolutionError("every appId slot and value must be a non-empty string")
     if not isinstance(temporary_authorization_code, str) or not temporary_authorization_code.strip():
-        raise ResolutionError("the temporary authorization code environment variable is empty")
+        raise ResolutionError("the temporary authorization code input is empty")
+    temporary_authorization_code = temporary_authorization_code.strip()
+    if lookup_attempts < 1:
+        raise ResolutionError("lookup_attempts must be at least 1")
     selected_user_types = user_application_types or {}
     if set(selected_user_types) - set(application_ids):
         raise ResolutionError("applicationType contains a slot that has no matching appId")
@@ -372,18 +390,59 @@ def resolve_applications(
     client_tokens: dict[str, str] = {}
     for slot, app_id in application_ids.items():
         app_url = f"{site.ai_api_url}{RUM_APP_GET_PATH}"
-        app_payload = json_poster(
-            app_url,
-            {"app_id": app_id.strip()},
-            {"DF-API-KEY": api_key},
-            f"RUM application lookup for slot {slot}",
-        )
-        app_item = _response_item(app_payload, f"RUM application lookup for slot {slot}")
+        operation = f"RUM application lookup for slot {slot}"
+        app_item: dict[str, Any] | None = None
+        for attempt in range(lookup_attempts):
+            app_payload = json_poster(
+                app_url,
+                {"app_id": app_id.strip()},
+                {"DF-API-KEY": api_key},
+                operation,
+            )
+            candidate = _response_item(app_payload, operation)
+            returned_app_id = candidate.get("app_id")
+            if returned_app_id is not None and returned_app_id != app_id.strip():
+                raise ResolutionError(f"{operation} returned a different app_id")
+
+            token_expired = candidate.get("token_expired")
+            sync_status = candidate.get("client_token_sync_status")
+            mapping_status = candidate.get("mapping_status")
+            mapping_ready = candidate.get("mapping_ready")
+            if token_expired is not False:
+                raise ResolutionError(f"{operation} returned an expired or unverifiable Client Token")
+            if sync_status in {"failed", "not_applicable"}:
+                raise ResolutionError(f"{operation} reported Client Token synchronization failure")
+            if mapping_status == "failed":
+                raise ResolutionError(f"{operation} reported application mapping failure")
+            if (
+                sync_status == "accepted"
+                and mapping_status == "ready"
+                and mapping_ready is True
+            ):
+                app_item = candidate
+                break
+            if (
+                sync_status not in {"accepted", "queued"}
+                or mapping_status not in {"pending", "ready"}
+                or not isinstance(mapping_ready, bool)
+            ):
+                raise ResolutionError(f"{operation} returned unsupported readiness metadata")
+            if attempt + 1 < lookup_attempts:
+                sleeper(retry_delay)
+
+        if app_item is None:
+            raise ResolutionError(
+                f"{operation} did not become ready after {lookup_attempts} attempts"
+            )
         client_token = app_item.get("client_token")
         api_application_type = app_item.get("app_type")
-        if not isinstance(client_token, str) or not client_token:
+        if (
+            not isinstance(client_token, str)
+            or not client_token
+            or not CLIENT_TOKEN_PATTERN.fullmatch(client_token)
+        ):
             raise ResolutionError(
-                f"RUM application lookup for slot {slot} did not return data.item.client_token"
+                f"{operation} did not return a usable data.item.client_token"
             )
         if api_application_type not in APPLICATION_TYPES:
             raise ResolutionError(
@@ -397,6 +456,10 @@ def resolve_applications(
             "selected_app_type": user_type or api_application_type,
             "selected_app_type_source": "user" if user_type else "ai_api",
             "type_mismatch": bool(user_type and user_type != api_application_type),
+            "token_expired": False,
+            "client_token_sync_status": app_item["client_token_sync_status"],
+            "mapping_status": app_item["mapping_status"],
+            "mapping_ready": True,
         }
         client_tokens[slot] = client_token
 
@@ -412,6 +475,7 @@ def resolve_applications(
         },
         "applications": applications,
         "credential_resolution": {
+            "status": "resolved",
             "exchange_path": EXCHANGE_PATH,
             "application_lookup_path": RUM_APP_GET_PATH,
             "api_key_persistence": "memory_only",
@@ -431,9 +495,21 @@ def _is_within(path: Path, parent: Path) -> bool:
 def _require_git_ignored(path: Path, repository: Path) -> None:
     repository = repository.resolve()
     path = path.resolve()
-    if not _is_within(path, repository):
-        return
     try:
+        root_result = subprocess.run(
+            ["git", "-C", str(repository), "rev-parse", "--show-toplevel"],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+        if (
+            root_result.returncode != 0
+            or Path(root_result.stdout.strip()).resolve() != repository
+        ):
+            raise ResolutionError("--repository must point to the Git worktree root")
+        if not _is_within(path, repository):
+            return
         relative = path.relative_to(repository)
         result = subprocess.run(
             ["git", "-C", str(repository), "check-ignore", "-q", "--", str(relative)],
@@ -489,16 +565,19 @@ def write_client_tokens_env(
     if repository is not None:
         _require_git_ignored(output, repository)
 
-    output.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    descriptor = os.open(output, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    created = False
     try:
+        output.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        descriptor = os.open(output, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        created = True
         with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
             for slot in sorted(client_tokens):
                 stream.write(f"{environment_names[slot]}={client_tokens[slot]}\n")
-    except Exception:
-        output.unlink(missing_ok=True)
-        raise
-    os.chmod(output, 0o600)
+        os.chmod(output, 0o600)
+    except OSError:
+        if created:
+            output.unlink(missing_ok=True)
+        raise ResolutionError("client-token env file could not be created safely") from None
     return output
 
 
@@ -513,11 +592,18 @@ def build_safe_result(
         "client_tokens": {
             slot: {
                 "source": f"runtime:{environment_name}",
-                "persisted": secret_file is not None,
-                "secret_file": str(secret_file) if secret_file is not None else None,
+                "availability": "persisted" if secret_file is not None else "planned",
             }
             for slot, environment_name in sorted(client_token_environments.items())
         },
+        "secret_sink": (
+            {
+                "path": str(secret_file),
+                "format": "dotenv",
+            }
+            if secret_file is not None
+            else None
+        ),
     }
 
 
@@ -552,21 +638,93 @@ def default_client_token_environments(application_ids: dict[str, str]) -> dict[s
     return environments
 
 
+def read_temporary_authorization_code(
+    *,
+    environment_name: str | None,
+    from_stdin: bool,
+) -> str:
+    if from_stdin:
+        if sys.stdin.isatty():
+            temporary_code = getpass.getpass("Temporary authorization code: ")
+        else:
+            temporary_code = sys.stdin.readline().rstrip("\r\n")
+    else:
+        selected_environment = environment_name or DEFAULT_TEMP_CODE_ENV
+        if not ENV_NAME_PATTERN.fullmatch(selected_environment):
+            raise ResolutionError("temporary authorization code environment name is invalid")
+        temporary_code = os.environ.get(selected_environment, "")
+    if not temporary_code.strip():
+        raise ResolutionError("the temporary authorization code input is empty")
+    return temporary_code.strip()
+
+
+def site_metadata(site: Site) -> dict[str, Any]:
+    return {
+        "site": {
+            "brand": site.brand,
+            "code": site.code,
+            "catalog": site.catalog_url,
+            "catalog_kind": site.catalog_kind,
+            "dataway_url": site.dataway_url,
+            "ai_api": site.ai_api_url,
+            "tls_verification": site.tls_verification,
+        },
+        "credential_resolution": {
+            "status": "catalog_resolved",
+            "exchange_path": EXCHANGE_PATH,
+            "application_lookup_path": RUM_APP_GET_PATH,
+            "api_key_persistence": "memory_only",
+        },
+    }
+
+
+def write_metadata_file(path: Path, rendered: str) -> Path:
+    candidate = path.expanduser()
+    if candidate.exists() or candidate.is_symlink():
+        raise ResolutionError("metadata file already exists; refusing to overwrite it")
+    output = candidate.resolve()
+    created = False
+    try:
+        output.parent.mkdir(parents=True, exist_ok=True)
+        descriptor = os.open(output, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        created = True
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            stream.write(f"{rendered}\n")
+    except OSError:
+        if created:
+            output.unlink(missing_ok=True)
+        raise ResolutionError("metadata file could not be created safely") from None
+    return output
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataway-url", required=True)
     parser.add_argument(
         "--app-id",
         action="append",
-        required=True,
         help="repeat [slot=]APP_ID for independently deployed applications",
+    )
+    parser.add_argument(
+        "--site-only",
+        action="store_true",
+        help="resolve only the official site catalog; do not exchange credentials or look up applications",
     )
     parser.add_argument(
         "--application-type",
         action="append",
         help="repeat [slot=]TYPE; user values take precedence over AI API metadata",
     )
-    parser.add_argument("--temporary-auth-code-env", default=DEFAULT_TEMP_CODE_ENV)
+    temporary_code_source = parser.add_mutually_exclusive_group()
+    temporary_code_source.add_argument(
+        "--temporary-auth-code-env",
+        help=f"read the code from this environment variable; defaults to {DEFAULT_TEMP_CODE_ENV}",
+    )
+    temporary_code_source.add_argument(
+        "--temporary-auth-code-stdin",
+        action="store_true",
+        help="read one code line from stdin; terminal input is hidden",
+    )
     parser.add_argument(
         "--client-token-env",
         action="append",
@@ -575,6 +733,11 @@ def main() -> int:
     parser.add_argument("--client-token-env-file", type=Path)
     parser.add_argument("--repository", type=Path)
     parser.add_argument("--metadata-file", type=Path)
+    parser.add_argument(
+        "--allow-external-secret-sink",
+        action="store_true",
+        help="allow an explicitly reviewed secret sink outside the repository",
+    )
     parser.add_argument(
         "--test-site-catalog-file",
         type=Path,
@@ -588,13 +751,36 @@ def main() -> int:
     arguments = parser.parse_args()
 
     try:
-        if not ENV_NAME_PATTERN.fullmatch(arguments.temporary_auth_code_env):
-            raise ResolutionError("temporary authorization code environment name is invalid")
         application_ids = parse_slot_assignments(arguments.app_id, "appId")
         application_types = parse_slot_assignments(
             arguments.application_type,
             "applicationType",
         )
+        if arguments.site_only:
+            incompatible = (
+                application_ids
+                or application_types
+                or arguments.temporary_auth_code_env
+                or arguments.temporary_auth_code_stdin
+                or arguments.client_token_env
+                or arguments.client_token_env_file
+                or arguments.repository
+                or arguments.allow_external_secret_sink
+            )
+            if incompatible:
+                raise ResolutionError(
+                    "--site-only accepts only site resolution and optional metadata output"
+                )
+        elif not application_ids:
+            raise ResolutionError("at least one --app-id is required unless --site-only is used")
+        elif arguments.client_token_env_file is None:
+            raise ResolutionError(
+                "application lookup requires --client-token-env-file so the Client Token is not discarded"
+            )
+        elif arguments.metadata_file is None:
+            raise ResolutionError(
+                "application lookup requires --metadata-file for recoverable non-secret results"
+            )
         client_token_environments = (
             parse_slot_assignments(arguments.client_token_env, "client-token environment")
             if arguments.client_token_env
@@ -612,8 +798,37 @@ def main() -> int:
                 raise ResolutionError(
                     "client-token env file already exists; refusing to overwrite it"
                 )
-            if arguments.repository is not None:
-                _require_git_ignored(candidate.resolve(), arguments.repository)
+            if arguments.repository is None:
+                raise ResolutionError(
+                    "--client-token-env-file requires --repository for Git ignore verification"
+                )
+        if arguments.metadata_file is not None:
+            metadata_candidate = arguments.metadata_file.expanduser()
+            if metadata_candidate.exists() or metadata_candidate.is_symlink():
+                raise ResolutionError("metadata file already exists; refusing to overwrite it")
+            if (
+                arguments.client_token_env_file is not None
+                and metadata_candidate.resolve()
+                == arguments.client_token_env_file.expanduser().resolve()
+            ):
+                raise ResolutionError(
+                    "metadata file and client-token env file must use different paths"
+                )
+        if arguments.client_token_env_file is not None:
+            repository_root = arguments.repository.expanduser().resolve()
+            secret_output = arguments.client_token_env_file.expanduser().resolve()
+            if (
+                not _is_within(secret_output, repository_root)
+                and not arguments.allow_external_secret_sink
+            ):
+                raise ResolutionError(
+                    "an external client-token sink requires --allow-external-secret-sink"
+                )
+        if arguments.client_token_env_file is not None:
+            _require_git_ignored(
+                arguments.client_token_env_file.expanduser().resolve(),
+                arguments.repository,
+            )
         testing_override = arguments.test_site_catalog_file is not None
         tls_context = build_ai_api_tls_context(
             insecure_test_tls=arguments.insecure_test_tls,
@@ -628,7 +843,21 @@ def main() -> int:
             if arguments.test_site_catalog_file is not None
             else resolve_site(arguments.dataway_url)
         )
-        temporary_code = os.environ.get(arguments.temporary_auth_code_env, "")
+        if arguments.site_only:
+            rendered = json.dumps(
+                site_metadata(site),
+                ensure_ascii=False,
+                indent=2,
+                sort_keys=True,
+            )
+            if arguments.metadata_file is not None:
+                write_metadata_file(arguments.metadata_file, rendered)
+            print(rendered)
+            return 0
+        temporary_code = read_temporary_authorization_code(
+            environment_name=arguments.temporary_auth_code_env,
+            from_stdin=arguments.temporary_auth_code_stdin,
+        )
 
         def selected_json_poster(
             url: str,
@@ -651,23 +880,30 @@ def main() -> int:
             user_application_types=application_types,
             json_poster=selected_json_poster,
         )
-        secret_file = None
-        if arguments.client_token_env_file is not None:
-            secret_file = write_client_tokens_env(
-                arguments.client_token_env_file,
-                client_token_environments,
-                client_tokens,
-                repository=arguments.repository,
-            )
+        intended_secret_file = arguments.client_token_env_file.expanduser().resolve()
         result = build_safe_result(
             metadata,
             client_token_environments=client_token_environments,
-            secret_file=secret_file,
+            secret_file=intended_secret_file,
         )
         rendered = json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True)
-        if arguments.metadata_file is not None:
-            arguments.metadata_file.parent.mkdir(parents=True, exist_ok=True)
-            arguments.metadata_file.write_text(f"{rendered}\n", encoding="utf-8")
+        secret_file = write_client_tokens_env(
+            arguments.client_token_env_file,
+            client_token_environments,
+            client_tokens,
+            repository=arguments.repository,
+        )
+        try:
+            write_metadata_file(arguments.metadata_file, rendered)
+        except ResolutionError as metadata_error:
+            try:
+                secret_file.unlink(missing_ok=True)
+            except OSError:
+                raise ResolutionError(
+                    "metadata persistence failed and the new client-token sink "
+                    "could not be rolled back; remove that sink before retrying"
+                ) from None
+            raise metadata_error
         print(rendered)
         return 0
     except ResolutionError as error:

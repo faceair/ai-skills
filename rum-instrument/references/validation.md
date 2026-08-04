@@ -2,13 +2,15 @@
 
 ## Plan validation
 
-Before requesting approval:
+Before stopping for review or beginning implementation:
 
 ```bash
-python3 <skill-dir>/scripts/validate_contract.py .rum/plan.json
+python3 <skill-dir>/scripts/validate_contract.py .rum/plan.json --kind plan --phase plan
 ```
 
 Confirm detector candidates against real manifests and entry points. The plan must list every target, Application ID slot, exact edit, receiver mapping, privacy control, validation command, risk, and rollback.
+
+For Revision Review, recompute the canonical plan digest and verify it equals `approval.reviewed_plan_sha256`. Hash every approved dirty overlap and verify it still equals the recorded `reviewed_overlaps` digest. Reject symlinked/out-of-worktree planned paths and any new dirty planned file.
 
 For Public DataWay, also validate:
 
@@ -16,7 +18,9 @@ For Public DataWay, also validate:
 - `ai_api` comes from the matched catalog entry rather than hostname rewriting;
 - the exchange and application lookup paths are exact;
 - stdout, metadata, plans, diffs, and Git status contain no temporary code, API Key, or Client Token value;
-- an in-repository secret env file is ignored and mode `0600`.
+- an in-repository restricted environment-assignment file is ignored and mode `0600`.
+- the application lookup used both a new restricted configuration sink and a distinct new metadata file; a simulated metadata-write failure leaves no orphan Client Token sink;
+- before application-code edits, `control_plane.status` is `resolved`, every selected application type records `matched`/`mismatched` plus `api_value`, and the resolved plan passes implementation validation.
 
 For an approved test-site override, additionally validate:
 
@@ -26,7 +30,7 @@ For an approved test-site override, additionally validate:
 - `--insecure-test-tls` was explicitly approved and cannot run without the test catalog;
 - the test catalog, TLS exception, and any HTTP DataWay receiver are excluded from production configuration.
 
-For DataKit, assert that no control-plane lookup, temporary code, API Key, or Client Token is present.
+For DataKit, assert that no control-plane lookup, temporary code, API Key, or Client Token is present. Require evidence that the RUM collector is enabled/configured and that the target runtime can reach the exact DataKit origin; unknown or blocked readiness prevents implementation.
 
 ## Local implementation proof
 
@@ -39,7 +43,7 @@ Run the repository's documented format, build/type-check, unit, integration, and
 - `service`, `version`, and `env` come from the recorded sources;
 - SDK load/init failure does not break application startup;
 - rerunning the implementation adds no duplicate dependency, initializer, config, or plugin;
-- an existing approved Client Token sink is preserved without another credential exchange;
+- an existing reviewed Client Token sink is preserved without another credential exchange;
 - existing network requests, signing, redirects, retries, and cancellation remain unchanged.
 
 Use SDK debug output only as supporting evidence. It does not prove remote ingestion.
@@ -71,7 +75,13 @@ When applicable, generate without uploading and verify:
 
 ## Inventory validation
 
-Validate `.rum/instrumentation.json` using the contract rules and compare it with `docs/rum-instrumentation.md`. Every target must have one disposition and evidence or a concrete blocker.
+Validate `.rum/instrumentation.json` using:
+
+```bash
+python3 <skill-dir>/scripts/validate_contract.py .rum/instrumentation.json --kind instrumentation
+```
+
+Every target must have one disposition and evidence or a concrete blocker. If optional `docs/rum-instrumentation.md` was generated, compare it with the JSON inventory.
 
 Set:
 

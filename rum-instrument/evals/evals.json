@@ -3,58 +3,295 @@
   "evals": [
     {
       "id": 1,
-      "prompt": "使用 $rum-instrument 规划这个已有异步 CDN RUM 接入的 Vue Web 仓库。\n\ndatawayUrl: {{DATAWAY_URL}}\ntemporaryAuthCode: env:GUANCE_TEMP_AUTH_CODE\nappId: {{APP_ID}}\napplicationType: web",
-      "expected_output": "生成 plan-only 的完整仓库审计和 revision 计划；通过官方站点目录与 AI API 安全解析应用，识别既有初始化与重复/漂移风险，不修改业务代码，不输出任何凭证值。",
-      "files": [],
+      "prompt": "使用 $rum-instrument 规划这个已有 RUM 初始化的 Vue Web 仓库。\n\ndatawayUrl: {{DATAWAY_URL}}\nappId: {{APP_ID}}\napplicationType: web",
+      "expected_output": "只解析官方站点目录并生成 plan-only 的 revision 计划；识别既有初始化并收敛，不消费授权码、不查询应用、不修改业务代码。",
+      "files": [
+        "evals/files/vue-existing/package.json",
+        "evals/files/vue-existing/src/main.ts",
+        "evals/files/vue-existing/src/rum.ts"
+      ],
       "expectations": [
-        "将输入字段归一化为 Public DataWay 接收模式、临时授权码来源和运行时 Client Token 引用",
-        "AI API Endpoint 来自匹配的 Guance/TrueWatch 站点目录而非 Owl 或主机名改写",
+        "将输入字段归一化为 Public DataWay、web Application ID 槽位和 availability=planned 的运行时 Client Token 引用",
+        "规划阶段仅使用 helper 的 --site-only，AI API Endpoint 来自匹配的 Guance/TrueWatch 目录",
+        "规划阶段不要求或消费临时授权码，不交换 API Key，不调用 /api/v1/rum/app/get",
         "用户 applicationType 优先于 AI API 和仓库自动识别",
         "识别并收敛已有 RUM，而不是增加第二个初始化器",
-        "计划包含隐私、Trace、Replay、Sourcemap 和本地验证决策",
+        "未检测到且未请求的 Logs、Trace、Replay、WebView 和 Sourcemap 不生成冗余计划",
         "计划保持 pending，明确等待 revision 审批",
         "输出和计划中不包含临时授权码、API Key 或 Client Token 值"
       ]
     },
     {
       "id": 2,
-      "prompt": "使用 $rum-instrument 规划 Flutter Android、iOS 和 Web 的观测云 RUM 接入。\n\ndatawayUrl: {{DATAWAY_URL}}\ntemporaryAuthCode: env:GUANCE_TEMP_AUTH_CODE\nappId:\n  android: {{ANDROID_APP_ID}}\n  ios: {{IOS_APP_ID}}\n  web: {{WEB_APP_ID}}\napplicationType:\n  android: android\n  ios: ios\n  web: web",
+      "prompt": "使用 $rum-instrument 规划 Flutter Android、iOS 和 Web 的观测云 RUM 接入。\n\ndatawayUrl: {{DATAWAY_URL}}\nappId:\n  android: {{ANDROID_APP_ID}}\n  ios: {{IOS_APP_ID}}\n  web: {{WEB_APP_ID}}\napplicationType:\n  android: android\n  ios: ios\n  web: web",
       "expected_output": "把 Flutter mobile 与 Flutter Web 路由到正确适配器，保留三个独立 Application ID，只输出待审批计划。",
-      "files": [],
+      "files": [
+        "evals/files/flutter-multiplatform/pubspec.yaml",
+        "evals/files/flutter-multiplatform/lib/main.dart",
+        "evals/files/flutter-multiplatform/web/index.html",
+        "evals/files/flutter-multiplatform/android/app/build.gradle",
+        "evals/files/flutter-multiplatform/android/app/src/main/AndroidManifest.xml",
+        "evals/files/flutter-multiplatform/ios/Runner.xcodeproj/project.pbxproj"
+      ],
       "expectations": [
-        "Android、iOS 和 Web 使用三个独立 Application ID 槽位",
+        "Android、iOS 和 Web 使用三个独立 Application ID 与 Client Token 槽位",
         "Flutter Web 使用 Browser RUM 且不修改 build/web",
         "移动端与原生 SDK 初始化不会重复",
-        "Session Replay 默认关闭或明确要求隐私审批",
-        "Sourcemap、dSYM 和 Android mapping 仅规划不上传"
+        "规划阶段只解析站点目录，不读取授权码或查询应用",
+        "Session Replay 默认关闭且不添加未请求的 Replay 包",
+        "Sourcemap、dSYM 和 Android mapping 在仓库未使用且用户未请求时不做额外规划"
       ]
     },
     {
       "id": 3,
       "prompt": "使用 $rum-instrument 规划当前 monorepo 的观测云 RUM 接入。\n\ndatakitUrl: {{DATAKIT_URL}}\nappId: {{APP_ID}}",
       "expected_output": "自动识别所有部署目标；当 scalar appId 无法唯一映射到多个独立应用时不把它分配给任一目标，完成其余分析并阻塞所有未解析的 ID 槽位。",
-      "files": [],
+      "files": [
+        "evals/files/monorepo/apps/admin/package.json",
+        "evals/files/monorepo/apps/admin/src/main.ts",
+        "evals/files/monorepo/apps/storefront/package.json",
+        "evals/files/monorepo/apps/storefront/src/main.tsx"
+      ],
       "expectations": [
         "从 datakitUrl 自动识别 DataKit 接收模式且不触发控制面或 Client Token 流程",
+        "DataKit readiness 记录 RUM collector 与应用运行时网络可达性的验证/交接状态",
         "记录 appId 的 scalar 输入形态，不会将它复制或任意分配给多个未解析目标中的任意一个",
+        "重复的 web 槽位使用目标限定名称，而不是生成两个同名仓库级槽位",
         "所有未解析的独立应用均标记 blocked，并只请求对应的目标级 Application ID",
         "仍然完成仓库、平台、现有接入和验证分析",
-        "只询问无法映射的 Application ID，不要求用户提供完整 Profile",
         "不修改应用代码并输出 pending revision"
       ]
     },
     {
       "id": 4,
-      "prompt": "使用 $rum-instrument 规划当前 Vue Web 仓库在隔离测试环境的观测云 RUM 接入。测试 DataWay 不在官方站点目录中，已提供一个本地 JSON 测试目录文件；测试 AI API 使用 HTTPS，但当前机器不信任其证书链，允许仅本次测试跳过证书验证。\n\ndatawayUrl: http://testing-openway.dataflux.cn\ntemporaryAuthCode: env:GUANCE_TEMP_AUTH_CODE\nappId: testing_web_manage",
-      "expected_output": "标准 Prompt 保持最小输入；执行层显式使用测试目录和测试 TLS 开关，准确解析应用类型与 Client Token 引用，并在计划中隔离所有测试例外。",
-      "files": [],
+      "prompt": "使用 $rum-instrument 规划当前 Vue Web 仓库在隔离测试环境的观测云 RUM 接入。测试 DataWay 不在官方站点目录中，已提供本地测试目录；当前机器不信任测试 AI API 的证书链，允许仅本次测试跳过证书验证。\n\ndatawayUrl: http://testing-openway.dataflux.cn\nappId: testing_web_manage",
+      "expected_output": "规划阶段显式使用测试目录和测试 TLS 开关，只解析站点元数据，并在计划中隔离所有测试例外。",
+      "files": [
+        "evals/files/vue-existing/package.json",
+        "evals/files/vue-existing/src/main.ts",
+        "evals/files/test-site-catalog.json"
+      ],
       "expectations": [
         "标准 Prompt 不新增 clientToken 或 aiApiEndpoint 字段",
         "仅通过 --test-site-catalog-file 启用自定义目录，并对 DataWay 做精确匹配",
         "AI API 仍要求 HTTPS，--insecure-test-tls 只能与测试目录一起使用",
-        "计划记录 catalog=testing_override、test_only=true、目录来源和 TLS 验证状态",
-        "输出中不包含临时授权码、API Key 或 Client Token 值",
+        "计划记录 catalog=testing_override、status=catalog_resolved、test_only=true、目录来源和 TLS 验证状态",
+        "规划阶段不读取授权码、不调用应用 API，也不丢弃 Client Token",
         "明确禁止把测试目录、TLS 例外或 HTTP DataWay 推广到生产"
+      ]
+    },
+    {
+      "id": 5,
+      "prompt": "使用 $rum-instrument 规划这个 macOS 应用的观测云 RUM 接入。\n\ndatawayUrl: {{DATAWAY_URL}}\nappId: {{MACOS_APP_ID}}",
+      "expected_output": "识别独立 macOS 应用，使用 datakit-macos/FTMacOSSDK 和 main 启动路径，应用类型降级为 custom，并输出待审批计划。",
+      "files": [
+        "evals/files/macos-app/App.xcodeproj/project.pbxproj",
+        "evals/files/macos-app/Podfile",
+        "evals/files/macos-app/Sources/main.swift"
+      ],
+      "expectations": [
+        "读取 references/macos.md 而不是把 macOS 套用为 datakit-ios/FTMobileSDK",
+        "依赖映射为 datakit-macos 和 FTMacOSSDK",
+        "Public DataWay 映射为 FTSDKConfig(datawayUrl:clientToken:)，Application ID 映射为 FTRumConfig(appid:)",
+        "初始化计划位于 main.swift 或 main.m 且早于 NSApplicationMain",
+        "仓库降级识别的 applicationType 为 custom，不是 ios"
+      ]
+    },
+    {
+      "id": 6,
+      "prompt": "使用 $rum-instrument 规划这个 C++ 桌面应用的观测云 RUM 接入。\n\ndatawayUrl: {{DATAWAY_URL}}\nappId: {{CPP_APP_ID}}",
+      "expected_output": "识别 C++ 目标，但因当前官方 C++ 接入只支持 DataKit 而将 Public DataWay 接入标记为 blocked，不伪造 Client Token 配置。",
+      "files": [
+        "evals/files/cpp-app/CMakeLists.txt",
+        "evals/files/cpp-app/src/main.cpp"
+      ],
+      "expectations": [
+        "读取 references/cpp.md 并识别当前官方指南只有 setServerUrl 的 DataKit 路径",
+        "C++ Public DataWay 目标标记 blocked",
+        "不生成 C++ Client Token 字段或借用其他平台的 Public DataWay API",
+        "只请求用户改用 datakitUrl 或提供经官方文档验证的新能力依据"
+      ]
+    },
+    {
+      "id": 7,
+      "prompt": "使用 $rum-instrument 规划这个 C++ 桌面应用的观测云 RUM 接入。\n\ndatakitUrl: {{DATAKIT_URL}}\nappId: {{CPP_APP_ID}}",
+      "expected_output": "使用 C++ 官方 DataKit 路径规划 setServerUrl、setRumAppId 和单例 SDK 生命周期，并输出待审批计划。",
+      "files": [
+        "evals/files/cpp-app/CMakeLists.txt",
+        "evals/files/cpp-app/src/main.cpp"
+      ],
+      "expectations": [
+        "DataKit 模式不出现控制面、授权码、API Key 或 Client Token",
+        "DataKit readiness 未同时验证 RUM collector 和 network reachability 时不开始实施",
+        "接收地址映射到 setServerUrl，Application ID 映射到 setRumAppId",
+        "只规划一个进程级初始化和确定性的 shutdown/flush",
+        "计划保持 pending 且不修改应用代码"
+      ]
+    },
+    {
+      "id": 8,
+      "prompt": "使用 $rum-instrument 规划并实施这个 Vue Web 仓库的观测云 RUM 接入。\n\ndatawayUrl: {{DATAWAY_URL}}\nappId: {{APP_ID}}\ntemporaryAuthCode: eval-only-one-time-code",
+      "expected_output": "先生成并验证 schema v2 计划；普通核心 RUM 变更以 explicit_implementation_request 预授权并在同一轮继续实施、验证和生成 inventory。",
+      "files": [
+        "evals/files/vue-existing/package.json",
+        "evals/files/vue-existing/src/main.ts",
+        "evals/files/vue-existing/src/rum.ts"
+      ],
+      "expectations": [
+        "request.intent 归一化为 implement，approval.status=approved、basis=explicit_implementation_request 且 blockers 为空",
+        "先完成站点目录解析、仓库分析和 plan-phase validation，再消费临时授权码",
+        "临时授权码在计划中只记录 prompt:provided，不出现在命令参数、文件、输出或最终报告",
+        "通过 stdin 调用 helper，获取的 Client Token 只写入已忽略且经过安全检查的运行时/构建配置 sink，并同时写入独立非敏感 metadata",
+        "application lookup 后把计划更新为 control_plane.status=resolved、Token availability=persisted，并记录 applicationType verification/api_value 后重新校验",
+        "不会为了例行 plan revision 再要求一次用户批准，而是在同一轮继续核心 RUM 接入",
+        "识别既有初始化并收敛，不添加重复 SDK 或初始化器",
+        "完成本地验证并生成 .rum/instrumentation.json，不把本地请求误报为远程上报成功"
+      ]
+    },
+    {
+      "id": 9,
+      "prompt": "使用 $rum-instrument 规划并实施当前 Vue Web 仓库在隔离测试环境的观测云 RUM 接入。测试 DataWay 不在官方站点目录中，已提供本地测试目录；允许仅本次测试跳过证书验证。\n\ndatawayUrl: http://testing-openway.dataflux.cn\nappId: testing_web_manage\ntemporaryAuthCode: eval-only-one-time-code",
+      "expected_output": "显式实施意图仍不能预授权测试目录和 TLS 例外；生成 pending 计划，记录 explicit_implementation_request basis 与具体 blockers，并在任何凭据交换或应用代码编辑前停止。",
+      "files": [
+        "evals/files/vue-existing/package.json",
+        "evals/files/vue-existing/src/main.ts",
+        "evals/files/test-site-catalog.json"
+      ],
+      "expectations": [
+        "计划使用 schema v2，approval.status=pending、basis=explicit_implementation_request",
+        "approval.blockers 明确列出 testing control-plane override 和 disabled TLS verification",
+        "不因 Prompt 中出现实施动词而绕过风险 Review",
+        "停止前不消费临时授权码、不调用 /api/v1/rum/app/get、不修改应用代码",
+        "Review 后只接受带 reviewed_plan_sha256 的 revision_review，并继续隔离测试例外，禁止进入生产配置"
+      ]
+    },
+    {
+      "id": 10,
+      "prompt": "使用 $rum-instrument 规划并实施这个 Vue Web 仓库的观测云 RUM 接入，并新增 Session Replay。\n\ndatawayUrl: {{DATAWAY_URL}}\nappId: {{APP_ID}}\ntemporaryAuthCode: eval-only-one-time-code",
+      "expected_output": "识别仓库没有既有 Replay，把新增 Replay 记录为结构化可选能力和强制 Review 条件；输出 pending 计划并在消费授权码或修改代码前停止。",
+      "files": [
+        "evals/files/vue-existing/package.json",
+        "evals/files/vue-existing/src/main.ts",
+        "evals/files/vue-existing/src/rum.ts"
+      ],
+      "expectations": [
+        "existing_instrumentation.signals 不包含 replay，而 profile.signals.replay 记录为启用",
+        "approval.status=pending、basis=explicit_implementation_request，blockers 明确包含 new optional signal replay",
+        "plan-phase validator 不允许把该计划标记为 explicit_implementation_request 的 approved 状态",
+        "停止前不消费临时授权码、不获取 Client Token、不添加 Replay 依赖或修改初始化器",
+        "只有用户 Review 对应 revision 后才使用 basis=revision_review 继续实施",
+        "Replay 实施范围必须包含同意机制、遮罩/排除范围和采样验证"
+      ]
+    },
+    {
+      "id": 11,
+      "prompt": "使用 $rum-instrument 规划 Android 应用的观测云 RUM 接入。\n\ndatakitUrl: {{DATAKIT_URL}}\nappId: {{ANDROID_APP_ID}}",
+      "expected_output": "识别 com.android.application 模块及 Application 启动点，规划 Android DataKit 核心 RUM，并把接收端就绪性作为实施门禁。",
+      "files": [
+        "evals/files/android-app/app/build.gradle.kts",
+        "evals/files/android-app/app/src/main/AndroidManifest.xml",
+        "evals/files/android-app/app/src/main/java/com/example/rum/App.kt"
+      ],
+      "expectations": [
+        "只把 com.android.application 模块识别为 Android 应用，不把 library 模块当成独立 RUM 目标",
+        "applicationType 使用 android，DataKit 验证状态为 not_applicable",
+        "计划包含 rum_collector 和 network_reachability 两项 DataKit readiness",
+        "不出现临时授权码、AI API、API Key 或 Client Token"
+      ]
+    },
+    {
+      "id": 12,
+      "prompt": "使用 $rum-instrument 规划 iOS 与 tvOS 应用的观测云 RUM 接入。\n\ndatawayUrl: {{DATAWAY_URL}}\nappId:\n  ios-phoneapp: {{IOS_APP_ID}}\n  tvos-tvapp: {{TVOS_APP_ID}}",
+      "expected_output": "识别同一 Xcode 工程中的多个 Apple 应用目标，保留目标限定 Application ID 槽位并使用 iOS/tvOS 官方适配器。",
+      "files": [
+        "evals/files/apple-mobile/App.xcodeproj/project.pbxproj",
+        "evals/files/apple-mobile/Sources/AppDelegate.swift"
+      ],
+      "expectations": [
+        "不会把多个 PBXNativeTarget 折叠成一个共享 Application ID",
+        "iOS 与 tvOS 的 applicationType 均映射为 ios",
+        "初始化位于维护的启动生命周期且不生成第二个初始化器",
+        "Public DataWay 初始类型验证为 pending，应用查询后再记录 matched 或 mismatched"
+      ]
+    },
+    {
+      "id": 13,
+      "prompt": "使用 $rum-instrument 规划小程序的观测云 RUM 接入。\n\ndatakitUrl: {{DATAKIT_URL}}\nappId: {{MINIAPP_APP_ID}}",
+      "expected_output": "识别原生 MiniApp 生命周期，规划 MiniApp DataKit 接入、网络域名交接和核心隐私控制。",
+      "files": [
+        "evals/files/miniapp/project.config.json",
+        "evals/files/miniapp/app.json",
+        "evals/files/miniapp/app.js"
+      ],
+      "expectations": [
+        "applicationType 为 miniapp",
+        "识别 app.js/app.json 生命周期而非仅凭 npm 依赖判断",
+        "DataKit 域名白名单只作为远程控制台 handoff，不自动修改远程配置",
+        "DataKit readiness 未验证时不得开始实施"
+      ]
+    },
+    {
+      "id": 14,
+      "prompt": "使用 $rum-instrument 规划 HarmonyOS 应用的观测云 RUM 接入。\n\ndatawayUrl: {{DATAWAY_URL}}\nappId: {{HARMONY_APP_ID}}",
+      "expected_output": "识别 HarmonyOS 工程和 Ability 启动点，规划官方 HarmonyOS RUM SDK 接入。",
+      "files": [
+        "evals/files/harmony-app/build-profile.json5",
+        "evals/files/harmony-app/oh-package.json5",
+        "evals/files/harmony-app/entry/src/main/ets/entryability/EntryAbility.ets"
+      ],
+      "expectations": [
+        "applicationType 为 harmonyos",
+        "依赖来源和版本决策包含 owner、version、官方来源、兼容性和验证日期",
+        "Public DataWay Client Token 只使用结构化 runtime/existing 引用",
+        "不把远程配置或崩溃能力作为默认新增范围"
+      ]
+    },
+    {
+      "id": 15,
+      "prompt": "使用 $rum-instrument 规划 React Native Android 与 iOS 的观测云 RUM 接入。\n\ndatawayUrl: {{DATAWAY_URL}}\nappId:\n  android: {{ANDROID_APP_ID}}\n  ios: {{IOS_APP_ID}}",
+      "expected_output": "把 React Native 包装层和原生子工程识别为一个逻辑目标，保留 Android/iOS 独立槽位且避免重复原生初始化。",
+      "files": [
+        "evals/files/react-native-app/package.json",
+        "evals/files/react-native-app/index.js",
+        "evals/files/react-native-app/android/app/build.gradle",
+        "evals/files/react-native-app/android/app/src/main/AndroidManifest.xml",
+        "evals/files/react-native-app/ios/App.xcodeproj/project.pbxproj"
+      ],
+      "expectations": [
+        "applicationType 为 reactnative，并保留 Android/iOS 独立 Application ID 与 Client Token 槽位",
+        "需要真实 JS 入口和原生平台证据，不能只凭 react-native 依赖判断",
+        "原生子工程由 React Native 目标拥有，不生成重复独立目标",
+        "新增 native_crash、ANR 或 Replay 必须单独 Review"
+      ]
+    },
+    {
+      "id": 16,
+      "prompt": "使用 $rum-instrument 规划 UniApp Android、iOS 与 H5 的观测云 RUM 接入。\n\ndatakitUrl: {{DATAKIT_URL}}\nappId:\n  android: {{ANDROID_APP_ID}}\n  ios: {{IOS_APP_ID}}\n  web: {{WEB_APP_ID}}",
+      "expected_output": "识别 UniApp 维护源和三个发布变体，路由到对应适配器且不编辑 unpackage 产物。",
+      "files": [
+        "evals/files/uniapp/manifest.json",
+        "evals/files/uniapp/pages.json"
+      ],
+      "expectations": [
+        "保留 Android、iOS、Web 三个 Application ID 槽位",
+        "禁止编辑 unpackage 和生成的原生输出",
+        "DataKit readiness 对实际发布运行时逐项验证",
+        "未请求的 Replay、Sourcemap 和原生 symbols 不做额外规划"
+      ]
+    },
+    {
+      "id": 17,
+      "prompt": "使用 $rum-instrument 规划 Unity Android 与 iOS 的观测云 RUM 接入。\n\ndatakitUrl: {{DATAKIT_URL}}\nappId:\n  android: {{ANDROID_APP_ID}}\n  ios: {{IOS_APP_ID}}",
+      "expected_output": "识别 Unity 项目和 Android/iOS 发布槽位，在维护的 C# 生命周期中规划单次初始化。",
+      "files": [
+        "evals/files/unity/ProjectSettings/ProjectVersion.txt",
+        "evals/files/unity/Assets/Scripts/Bootstrap.cs"
+      ],
+      "expectations": [
+        "Unity 是一个逻辑目标但保留 Android/iOS 独立 Application ID 槽位",
+        "不编辑 Library、Temp、构建输出或生成的原生工程",
+        "只规划一个可收敛的 SDK 生命周期和退出 flush",
+        "DataKit RUM collector 与网络可达性未验证时保持实施阻塞"
       ]
     }
   ]

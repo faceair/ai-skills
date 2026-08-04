@@ -15,16 +15,17 @@ Review existing custom context and Action payloads even when the SDK integration
 
 ## Receiver credentials
 
-Application IDs and receiver URLs are configuration. Temporary authorization codes and API Keys are credentials. Public DataWay Client Tokens are delivered to clients by design, but the Skill still treats their values as restricted:
+Application IDs and receiver URLs are configuration. A temporary authorization code is one-time input that the user may provide directly to the Agent. API Keys are server credentials. Public DataWay Client Tokens are delivered to client applications by design and therefore are not confidential from end users; the Skill treats them as restricted client configuration so they do not leak unnecessarily into Agent context, logs, Git history, or unrelated artifacts:
 
-- read a temporary authorization code only inside the bundled helper from its named environment variable;
+- accept a temporary authorization code directly from the Prompt or a later user message, but never repeat it;
+- pass a prompt-provided code to the bundled helper through process stdin; disable terminal echo when a TTY is available, and keep a named environment variable as the optional automation path;
 - keep the exchanged API Key only in helper-process memory;
-- route the Client Token directly to an approved secret env file or deployment secret sink;
-- preserve only `env:`, `runtime:`, or existing configuration references in plans and reports;
+- route the Client Token directly to a reviewed environment-assignment/build configuration sink;
+- preserve only the redacted `prompt:provided` marker, `env:`, `runtime:`, or existing configuration references in plans and reports;
 - do not echo, print, diff, stage, screenshot, or otherwise inspect credential values or the generated secret file;
-- never place a credential in command arguments, tracked source, fixtures, logs, or metadata.
+- never place a real authorization code, API Key, or Client Token in command arguments, tracked source, fixtures, logs, or metadata.
 
-The helper refuses to overwrite a secret file and refuses an in-repository sink that Git does not ignore. If the repository has no safe runtime/build-time configuration source, keep implementation blocked and leave value injection to the human deployment system.
+The helper refuses to overwrite a restricted configuration file, requires separate recoverable metadata, rolls back a newly written Client Token sink if metadata persistence fails, and refuses an in-repository sink that Git does not ignore. Its dotenv-shaped output does not justify adding a dotenv loader to native code. If the repository has no safe existing runtime/build-time injection source, keep implementation blocked and leave value injection to the human deployment system.
 
 An insecure TLS context is permitted only for an explicitly approved test-site catalog. Keep that context scoped to AI API requests in the helper, preserve verified TLS for official catalogs, and never persist certificate errors or credential-bearing response content.
 

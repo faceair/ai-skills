@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import ssl
 import stat
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -52,7 +53,22 @@ def catalog_fetcher(url: str):
     raise AssertionError(url)
 
 
+def ready_application(app_id: str, app_type: str, client_token: str) -> dict:
+    return {
+        "app_id": app_id,
+        "app_type": app_type,
+        "client_token": client_token,
+        "token_expired": False,
+        "client_token_sync_status": "accepted",
+        "mapping_status": "ready",
+        "mapping_ready": True,
+    }
+
+
 class ResolveRumApplicationTests(unittest.TestCase):
+    def init_git(self, repository: Path) -> None:
+        subprocess.run(["git", "init", "-q", str(repository)], check=True)
+
     def test_resolves_guance_and_truewatch_from_official_catalog_entries(self):
         guance = RESOLVER.resolve_site(
             "https://cn3-openway.guance.com/",
@@ -143,6 +159,12 @@ class ResolveRumApplicationTests(unittest.TestCase):
                 catalog_fetcher=catalog_fetcher,
             )
 
+    def test_rejects_malformed_origin_host_and_port(self):
+        for origin in ("https://open way.guance.com", "https://openway.guance.com:bad"):
+            with self.subTest(origin=origin):
+                with self.assertRaises(RESOLVER.ResolutionError):
+                    RESOLVER.normalize_origin(origin, "datawayUrl")
+
     def test_rejects_slot_names_that_could_inject_output(self):
         with self.assertRaisesRegex(RESOLVER.ResolutionError, "assignments"):
             RESOLVER.parse_slot_assignments(
@@ -170,12 +192,11 @@ class ResolveRumApplicationTests(unittest.TestCase):
             return {
                 "success": True,
                 "data": {
-                    "item": {
-                        "app_id": "web_demo",
-                        "name": "Web Demo",
-                        "app_type": "web",
-                        "client_token": "synthetic-client-token",
-                    }
+                    "item": ready_application(
+                        "web_demo",
+                        "web",
+                        "synthetic-client-token",
+                    )
                 },
             }
 
@@ -212,10 +233,7 @@ class ResolveRumApplicationTests(unittest.TestCase):
             return {
                 "success": True,
                 "data": {
-                    "item": {
-                        "app_type": "web",
-                        "client_token": "client-token",
-                    }
+                    "item": ready_application("app", "web", "client-token")
                 },
             }
 
@@ -276,10 +294,11 @@ class ResolveRumApplicationTests(unittest.TestCase):
             return {
                 "success": True,
                 "data": {
-                    "item": {
-                        "app_type": app_type,
-                        "client_token": f"{app_type}-client-token",
-                    }
+                    "item": ready_application(
+                        body["app_id"],
+                        app_type,
+                        f"{app_type}-client-token",
+                    )
                 },
             }
 
@@ -298,10 +317,76 @@ class ResolveRumApplicationTests(unittest.TestCase):
         )
         self.assertNotIn("client-token", str(metadata))
 
+    def test_retries_until_application_mapping_is_ready(self):
+        site = RESOLVER.Site(
+            brand="guance",
+            code="default",
+            catalog_url="https://urls.guance.com/",
+            dataway_url="https://openway.guance.com",
+            ai_api_url="https://ai-api.guance.com",
+        )
+        lookups = 0
+
+        def poster(url, body, headers, operation):
+            nonlocal lookups
+            if url.endswith(RESOLVER.EXCHANGE_PATH):
+                return {"success": True, "data": {"item": {"sk": "api-key"}}}
+            lookups += 1
+            item = ready_application("web_app", "web", "client-token")
+            if lookups == 1:
+                item.update(
+                    {
+                        "client_token_sync_status": "queued",
+                        "mapping_status": "pending",
+                        "mapping_ready": False,
+                    }
+                )
+            return {"success": True, "data": {"item": item}}
+
+        sleeper = mock.Mock()
+        metadata, tokens = RESOLVER.resolve_applications(
+            site,
+            {"web": "web_app"},
+            "temporary-code",
+            json_poster=poster,
+            retry_delay=0,
+            sleeper=sleeper,
+        )
+
+        self.assertEqual(2, lookups)
+        sleeper.assert_called_once_with(0)
+        self.assertEqual({"web": "client-token"}, tokens)
+        self.assertTrue(metadata["applications"]["web"]["mapping_ready"])
+
+    def test_rejects_expired_or_failed_client_token_state(self):
+        site = RESOLVER.Site(
+            brand="guance",
+            code="default",
+            catalog_url="https://urls.guance.com/",
+            dataway_url="https://openway.guance.com",
+            ai_api_url="https://ai-api.guance.com",
+        )
+
+        def expired_poster(url, body, headers, operation):
+            if url.endswith(RESOLVER.EXCHANGE_PATH):
+                return {"success": True, "data": {"item": {"sk": "api-key"}}}
+            item = ready_application("web_app", "web", "client-token")
+            item["token_expired"] = True
+            return {"success": True, "data": {"item": item}}
+
+        with self.assertRaisesRegex(RESOLVER.ResolutionError, "expired"):
+            RESOLVER.resolve_applications(
+                site,
+                {"web": "web_app"},
+                "temporary-code",
+                json_poster=expired_poster,
+                sleeper=lambda _: None,
+            )
+
     def test_refuses_unignored_in_repository_secret_file(self):
         with tempfile.TemporaryDirectory() as temporary:
             repository = Path(temporary)
-            (repository / ".git").mkdir()
+            self.init_git(repository)
             output = repository / ".rum" / "runtime-secrets.env"
 
             with self.assertRaisesRegex(RESOLVER.ResolutionError, "not git-ignored"):
@@ -311,6 +396,23 @@ class ResolveRumApplicationTests(unittest.TestCase):
                     "synthetic-client-token",
                     repository=repository,
                 )
+
+    def test_allows_ignored_in_repository_secret_file(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            repository = Path(temporary)
+            self.init_git(repository)
+            (repository / ".gitignore").write_text(".rum/\n", encoding="utf-8")
+            output = repository / ".rum" / "runtime-secrets.env"
+
+            written = RESOLVER.write_client_token_env(
+                output,
+                "GUANCE_RUM_CLIENT_TOKEN",
+                "synthetic-client-token",
+                repository=repository,
+            )
+
+            self.assertEqual(output.resolve(), written)
+            self.assertEqual(0o600, stat.S_IMODE(output.stat().st_mode))
 
     def test_cli_output_never_contains_credentials(self):
         site = RESOLVER.Site(
@@ -349,18 +451,59 @@ class ResolveRumApplicationTests(unittest.TestCase):
         stderr = io.StringIO()
         temporary_code = "synthetic-temporary-code"
         client_token = "synthetic-client-token"
+        with tempfile.TemporaryDirectory() as temporary:
+            repository = Path(temporary) / "repository"
+            repository.mkdir()
+            self.init_git(repository)
+            secret_file = Path(temporary) / "client-token.env"
+            metadata_file = Path(temporary) / "resolution.json"
+            with (
+                mock.patch.object(RESOLVER, "resolve_site", return_value=site),
+                mock.patch.object(
+                    RESOLVER,
+                    "resolve_applications",
+                    return_value=(metadata, {"default": client_token}),
+                ) as resolve_applications,
+                mock.patch.object(sys, "stdin", io.StringIO(f"{temporary_code}\n")),
+                mock.patch.object(
+                    sys,
+                    "argv",
+                    [
+                        str(SCRIPT),
+                        "--dataway-url",
+                        "https://openway.guance.com",
+                        "--app-id",
+                        "web_demo",
+                        "--temporary-auth-code-stdin",
+                        "--client-token-env-file",
+                        str(secret_file),
+                        "--metadata-file",
+                        str(metadata_file),
+                        "--allow-external-secret-sink",
+                        "--repository",
+                        str(repository),
+                    ],
+                ),
+                redirect_stdout(stdout),
+                redirect_stderr(stderr),
+            ):
+                result = RESOLVER.main()
+
+        rendered = stdout.getvalue() + stderr.getvalue()
+        self.assertEqual(0, result)
+        self.assertNotIn(temporary_code, rendered)
+        self.assertNotIn(client_token, rendered)
+        self.assertIn("runtime:GUANCE_RUM_CLIENT_TOKEN", rendered)
+        self.assertEqual(temporary_code, resolve_applications.call_args.args[2])
+
+    def test_cli_requires_secret_sink_before_catalog_or_code_access(self):
+        stderr = io.StringIO()
         with (
-            mock.patch.object(RESOLVER, "resolve_site", return_value=site),
+            mock.patch.object(RESOLVER, "resolve_site") as resolve_site,
             mock.patch.object(
                 RESOLVER,
-                "resolve_applications",
-                return_value=(metadata, {"default": client_token}),
-            ),
-            mock.patch.dict(
-                os.environ,
-                {RESOLVER.DEFAULT_TEMP_CODE_ENV: temporary_code},
-                clear=False,
-            ),
+                "read_temporary_authorization_code",
+            ) as read_code,
             mock.patch.object(
                 sys,
                 "argv",
@@ -370,23 +513,210 @@ class ResolveRumApplicationTests(unittest.TestCase):
                     "https://openway.guance.com",
                     "--app-id",
                     "web_demo",
+                    "--temporary-auth-code-stdin",
                 ],
             ),
-            redirect_stdout(stdout),
             redirect_stderr(stderr),
         ):
             result = RESOLVER.main()
 
-        rendered = stdout.getvalue() + stderr.getvalue()
-        self.assertEqual(0, result)
-        self.assertNotIn(temporary_code, rendered)
-        self.assertNotIn(client_token, rendered)
-        self.assertIn("runtime:GUANCE_RUM_CLIENT_TOKEN", rendered)
+        self.assertEqual(1, result)
+        resolve_site.assert_not_called()
+        read_code.assert_not_called()
+        self.assertIn("Client Token is not discarded", stderr.getvalue())
 
-    def test_existing_secret_sink_stops_before_credential_exchange(self):
+    def test_cli_requires_metadata_sink_before_catalog_or_code_access(self):
+        stderr = io.StringIO()
         with tempfile.TemporaryDirectory() as temporary:
-            output = Path(temporary) / "existing.env"
-            output.write_text("existing-content\n", encoding="utf-8")
+            repository = Path(temporary)
+            secret_file = repository / ".rum" / "client-token.env"
+            with (
+                mock.patch.object(RESOLVER, "resolve_site") as resolve_site,
+                mock.patch.object(
+                    RESOLVER,
+                    "read_temporary_authorization_code",
+                ) as read_code,
+                mock.patch.object(
+                    sys,
+                    "argv",
+                    [
+                        str(SCRIPT),
+                        "--dataway-url",
+                        "https://openway.guance.com",
+                        "--app-id",
+                        "web_demo",
+                        "--client-token-env-file",
+                        str(secret_file),
+                        "--repository",
+                        str(repository),
+                    ],
+                ),
+                redirect_stderr(stderr),
+            ):
+                result = RESOLVER.main()
+
+        self.assertEqual(1, result)
+        resolve_site.assert_not_called()
+        read_code.assert_not_called()
+        self.assertIn("requires --metadata-file", stderr.getvalue())
+
+    def test_metadata_failure_rolls_back_new_secret_sink(self):
+        site = RESOLVER.Site(
+            brand="guance",
+            code="default",
+            catalog_url="https://urls.guance.com/",
+            dataway_url="https://openway.guance.com",
+            ai_api_url="https://ai-api.guance.com",
+        )
+        metadata = {
+            "site": {"code": "default"},
+            "applications": {
+                "default": {
+                    "app_id": "web_demo",
+                    "api_app_type": "web",
+                    "selected_app_type": "web",
+                    "selected_app_type_source": "ai_api",
+                    "type_mismatch": False,
+                }
+            },
+            "credential_resolution": {
+                "exchange_path": RESOLVER.EXCHANGE_PATH,
+                "application_lookup_path": RESOLVER.RUM_APP_GET_PATH,
+                "api_key_persistence": "memory_only",
+            },
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            repository = Path(temporary)
+            self.init_git(repository)
+            (repository / ".gitignore").write_text(".rum/\n", encoding="utf-8")
+            secret_file = repository / ".rum" / "client-token.env"
+            metadata_file = repository / ".rum" / "resolution.json"
+            stderr = io.StringIO()
+            with (
+                mock.patch.object(RESOLVER, "resolve_site", return_value=site),
+                mock.patch.object(
+                    RESOLVER,
+                    "resolve_applications",
+                    return_value=(metadata, {"default": "synthetic-client-token"}),
+                ),
+                mock.patch.object(
+                    RESOLVER,
+                    "write_metadata_file",
+                    side_effect=RESOLVER.ResolutionError(
+                        "metadata file could not be created safely"
+                    ),
+                ),
+                mock.patch.object(sys, "stdin", io.StringIO("synthetic-code\n")),
+                mock.patch.object(
+                    sys,
+                    "argv",
+                    [
+                        str(SCRIPT),
+                        "--dataway-url",
+                        "https://openway.guance.com",
+                        "--app-id",
+                        "web_demo",
+                        "--temporary-auth-code-stdin",
+                        "--client-token-env-file",
+                        str(secret_file),
+                        "--metadata-file",
+                        str(metadata_file),
+                        "--repository",
+                        str(repository),
+                    ],
+                ),
+                redirect_stderr(stderr),
+            ):
+                result = RESOLVER.main()
+
+            self.assertEqual(1, result)
+            self.assertFalse(secret_file.exists())
+            self.assertIn("metadata file could not be created", stderr.getvalue())
+
+    def test_environment_source_remains_supported_for_automation(self):
+        temporary_code = "  synthetic-environment-code  "
+
+        with mock.patch.dict(
+            os.environ,
+            {"CUSTOM_RUM_AUTH_CODE": temporary_code},
+            clear=False,
+        ):
+            resolved = RESOLVER.read_temporary_authorization_code(
+                environment_name="CUSTOM_RUM_AUTH_CODE",
+                from_stdin=False,
+            )
+
+        self.assertEqual("synthetic-environment-code", resolved)
+
+    def test_stdin_source_rejects_empty_input_without_echoing_it(self):
+        with (
+            mock.patch.object(sys, "stdin", io.StringIO("\n")),
+            self.assertRaisesRegex(RESOLVER.ResolutionError, "input is empty"),
+        ):
+            RESOLVER.read_temporary_authorization_code(
+                environment_name=None,
+                from_stdin=True,
+            )
+
+    def test_tty_source_uses_hidden_input(self):
+        terminal = mock.Mock()
+        terminal.isatty.return_value = True
+        temporary_code = "synthetic-hidden-code"
+
+        with (
+            mock.patch.object(sys, "stdin", terminal),
+            mock.patch.object(
+                RESOLVER.getpass,
+                "getpass",
+                return_value=temporary_code,
+            ) as hidden_input,
+        ):
+            resolved = RESOLVER.read_temporary_authorization_code(
+                environment_name=None,
+                from_stdin=True,
+            )
+
+        self.assertEqual(temporary_code, resolved)
+        hidden_input.assert_called_once_with("Temporary authorization code: ")
+        terminal.readline.assert_not_called()
+
+    def test_site_only_resolution_does_not_read_authorization_code(self):
+        site = RESOLVER.Site(
+            brand="guance",
+            code="default",
+            catalog_url="https://urls.guance.com/",
+            dataway_url="https://openway.guance.com",
+            ai_api_url="https://ai-api.guance.com",
+        )
+        stdout = io.StringIO()
+        with (
+            mock.patch.object(RESOLVER, "resolve_site", return_value=site),
+            mock.patch.object(
+                RESOLVER,
+                "read_temporary_authorization_code",
+            ) as read_code,
+            mock.patch.object(
+                sys,
+                "argv",
+                [
+                    str(SCRIPT),
+                    "--dataway-url",
+                    "https://openway.guance.com",
+                    "--site-only",
+                ],
+            ),
+            redirect_stdout(stdout),
+        ):
+            result = RESOLVER.main()
+
+        self.assertEqual(0, result)
+        read_code.assert_not_called()
+        self.assertIn("catalog_resolved", stdout.getvalue())
+
+    def test_cli_requires_repository_for_client_token_file(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "token.env"
+            metadata = Path(temporary) / "resolution.json"
             stderr = io.StringIO()
             with (
                 mock.patch.object(RESOLVER, "resolve_site") as resolve_site,
@@ -401,6 +731,92 @@ class ResolveRumApplicationTests(unittest.TestCase):
                         "web_demo",
                         "--client-token-env-file",
                         str(output),
+                        "--metadata-file",
+                        str(metadata),
+                    ],
+                ),
+                redirect_stderr(stderr),
+            ):
+                result = RESOLVER.main()
+
+        self.assertEqual(1, result)
+        resolve_site.assert_not_called()
+        self.assertIn("requires --repository", stderr.getvalue())
+
+    def test_cli_rejects_metadata_and_secret_path_collision(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            repository = Path(temporary) / "repository"
+            repository.mkdir()
+            shared = Path(temporary) / "shared-output"
+            stderr = io.StringIO()
+            with (
+                mock.patch.object(RESOLVER, "resolve_site") as resolve_site,
+                mock.patch.object(
+                    sys,
+                    "argv",
+                    [
+                        str(SCRIPT),
+                        "--dataway-url",
+                        "https://openway.guance.com",
+                        "--app-id",
+                        "web_demo",
+                        "--client-token-env-file",
+                        str(shared),
+                        "--repository",
+                        str(repository),
+                        "--metadata-file",
+                        str(shared),
+                    ],
+                ),
+                redirect_stderr(stderr),
+            ):
+                result = RESOLVER.main()
+
+        self.assertEqual(1, result)
+        resolve_site.assert_not_called()
+        self.assertIn("different paths", stderr.getvalue())
+
+    def test_repository_subdirectory_cannot_bypass_ignore_check(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            repository = Path(temporary) / "repository"
+            repository.mkdir()
+            self.init_git(repository)
+            subdirectory = repository / "app"
+            subdirectory.mkdir()
+            output = repository / ".rum" / "client-token.env"
+
+            with self.assertRaisesRegex(
+                RESOLVER.ResolutionError,
+                "Git worktree root",
+            ):
+                RESOLVER.write_client_token_env(
+                    output,
+                    "GUANCE_RUM_CLIENT_TOKEN",
+                    "synthetic-client-token",
+                    repository=subdirectory,
+                )
+
+    def test_existing_secret_sink_stops_before_credential_exchange(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "existing.env"
+            output.write_text("existing-content\n", encoding="utf-8")
+            metadata = Path(temporary) / "resolution.json"
+            stderr = io.StringIO()
+            with (
+                mock.patch.object(RESOLVER, "resolve_site") as resolve_site,
+                mock.patch.object(
+                    sys,
+                    "argv",
+                    [
+                        str(SCRIPT),
+                        "--dataway-url",
+                        "https://openway.guance.com",
+                        "--app-id",
+                        "web_demo",
+                        "--client-token-env-file",
+                        str(output),
+                        "--metadata-file",
+                        str(metadata),
                     ],
                 ),
                 redirect_stderr(stderr),

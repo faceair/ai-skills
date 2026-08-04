@@ -1,0 +1,3 @@
+target "RumEvalMac" do
+  pod "FTMacOSSDK", "~> 1.0"
+end

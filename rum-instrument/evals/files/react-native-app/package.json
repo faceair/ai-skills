@@ -1,0 +1,6 @@
+{
+  "name": "react-native-rum-app",
+  "dependencies": {
+    "react-native": "0.80.0"
+  }
+}

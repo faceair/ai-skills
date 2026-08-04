@@ -6,7 +6,7 @@ Use these exact inference rules:
 
 | Supplied fields | Receiver mode | Normalized endpoint |
 |---|---|---|
-| `datawayUrl`, `temporaryAuthCode`, `appId` | `public_dataway` | `receiver.endpoint` from `datawayUrl` |
+| `datawayUrl`, `appId` (optional `temporaryAuthCode`) | `public_dataway` | `receiver.endpoint` from `datawayUrl` |
 | `datakitUrl`, `appId` | `datakit` | `receiver.endpoint` from `datakitUrl` |
 
 Reject multiple URL field families. Do not infer Public DataWay versus DataKit from a generic URL. `clientToken` and `aiApiEndpoint` are not standard-prompt inputs.
@@ -15,12 +15,13 @@ Normalize sources:
 
 - `{{NAME}}` → `template:NAME`
 - `env:NAME` → `env:NAME`
-- an existing repository variable → `existing:<path-or-config-key>`
+- a literal `temporaryAuthCode` or a separately pasted one-time code → `prompt:provided`
+- an existing repository variable → `existing:<path>#<config-key>`
 - a literal non-secret URL/Application ID → a plan value with provenance `user`
 
-Treat `temporaryAuthCode` as a credential source. Prefer `env:GUANCE_TEMP_AUTH_CODE`; never store its value in a plan, command argument, tracked file, or response.
+Treat `temporaryAuthCode` as transient implementation input. It is optional during planning and must not be consumed before plan-phase validation and implementation authorization. Direct Prompt input is the default user path for a one-Prompt implementation; `env:GUANCE_TEMP_AUTH_CODE` remains available for automation. Never store or repeat the literal value in a plan, command argument, tracked file, tool commentary, or response.
 
-For Public DataWay, use [control-plane.md](control-plane.md) and the bundled helper. Store the resolved Client Token only as an `env:`, `runtime:`, or already-existing configuration reference. A `template:CLIENT_TOKEN` source is invalid because the Agent must obtain the value through the control-plane flow.
+For Public DataWay, use [control-plane.md](control-plane.md) and the bundled helper. Store the resolved Client Token only as a structured `env:`, `runtime:`, or `existing:` configuration reference. Environment references use uppercase environment-style names; runtime references are environment names or dotted configuration paths; existing references identify a concrete path/key. A `template:CLIENT_TOKEN` source and a token-like literal disguised after `runtime:` are invalid.
 
 An explicitly approved test-site catalog is execution metadata, not a standard Prompt field. Record it as `catalog: testing_override`, keep its location as an `env:` or `existing:` source reference, and mark the control-plane resolution `test_only`.
 
@@ -35,7 +36,8 @@ The detector proposes slots; repository inspection confirms them.
 | Web | `web` |
 | MiniApp | one slot per independently released MiniApp |
 | Android | `android` |
-| iOS/tvOS/macOS | one slot per independent Apple application |
+| iOS/tvOS | one slot per independently released iOS/tvOS application |
+| macOS | one slot per independently released macOS application |
 | HarmonyOS | `harmonyos` |
 | React Native | `android`, `ios` |
 | Flutter mobile | `android`, `ios` |
@@ -47,16 +49,19 @@ The detector proposes slots; repository inspection confirms them.
 
 A scalar `appId` is valid only when one independent slot remains after target confirmation. Do not copy it across platforms. When IDs are missing, complete the rest of the plan and mark only those targets `blocked`.
 
-## Platform-field mapping
+Slot names are repository-wide identifiers, not merely platform labels. When two independent targets would both use `web`, `android`, `ios`, or another generic name, qualify the slots with stable target IDs, for example `storefront_web` and `admin_web`.
 
-The user-facing names are stable while SDK names differ. Each platform adapter maps:
+## Receiver capability and field mapping
 
-- `appId` to the SDK's application identifier;
-- `datawayUrl` to the current SDK's Public DataWay site/server field;
-- the helper-created runtime Client Token reference to the current SDK's Public DataWay client-token field;
-- `datakitUrl` to the exact current local receiver field.
+The user-facing names are stable while receiver support and SDK field names differ:
 
-Verify the mapping against the selected SDK version. Do not assume Web's `site` or `datakitOrigin` names apply to native SDKs.
+| Adapter | Public DataWay | DataKit | Mapping rule |
+|---|---|---|---|
+| Web, MiniApp, Android, iOS/tvOS, macOS, HarmonyOS | version-gated | version-gated | Map `appId`, receiver URL, and—only for Public DataWay—the helper-created Client Token reference through the selected SDK's current API |
+| React Native, Flutter, UniApp, Unity | version- and variant-gated | version- and variant-gated | Resolve each maintained wrapper/native variant without creating duplicate native initialization |
+| C++ | unsupported by the current official access guide | supported | Map `appId` and `datakitUrl` to `setRumAppId` and `setServerUrl`; block Public DataWay plans |
+
+Verify every mapping against the selected SDK version. Do not assume Web's `site`/`datakitOrigin`, Apple's initializer names, or any Client Token field exists on another adapter.
 
 ## Application type resolution
 
@@ -66,7 +71,20 @@ Resolve each Application ID slot in this order:
 2. Public DataWay AI API `app_type`;
 3. repository evidence.
 
-Record the selected `value`, `source` (`user`, `ai_api`, or `repository`), and `confidence`. DataKit normally uses user input or repository evidence because it has no AI API control-plane flow.
+Record the selected `value`, `source` (`user`, `ai_api`, or `repository`), `confidence`, `verification`, and `api_value`. Public DataWay uses `pending` before lookup and `matched`/`mismatched` after lookup. DataKit uses `not_applicable` and normally selects user input or repository evidence because it has no AI API control-plane flow.
+
+Use these repository fallbacks only after checking user input and, for Public DataWay, AI API metadata:
+
+| Target | Fallback application type |
+|---|---|
+| Web / Flutter Web / UniApp Web | `web` |
+| MiniApp / UniApp MiniApp | `miniapp` |
+| Android | `android` |
+| iOS/tvOS | `ios` |
+| macOS / C++ | `custom` |
+| HarmonyOS | `harmonyos` |
+| React Native | `reactnative` |
+| Flutter / UniApp / Unity native variants | the corresponding `android` or `ios` slot |
 
 ## Inferred profile
 
@@ -78,13 +96,13 @@ Infer rather than ask before planning:
 | `version` | existing release config → package/build version source | runtime-configured placeholder |
 | `env` | existing RUM/deployment environment source | runtime-configured placeholder |
 | core RUM | preserve valid existing state | enabled |
-| Logs | preserve existing | disabled |
-| Trace | preserve existing verified propagation | disabled with a plan recommendation |
-| Replay | preserve only with consent/masking evidence | disabled |
+| Logs | inspect only when present or requested | disabled |
+| Trace | inspect only when present or requested | disabled |
+| Replay | inspect only when present or requested; require consent/masking evidence | disabled |
 | sampling | existing environment-driven values | platform-supported, environment-driven proposal |
 | user/context fields | existing reviewed allowlist | none |
-| remote config | preserve verified existing behavior | disabled |
-| Sourcemap/symbol upload | preserve verified release pipeline | plan only, no upload |
+| remote config | inspect only when present or requested | disabled |
+| Sourcemap/symbol upload | inspect only when present or requested | omitted |
 
 For every inference record:
 
@@ -117,4 +135,4 @@ Prefer extracting a shared configuration or facade when multiple maintained entr
 
 ## Capability defaults
 
-RUM is universal across supported adapters, but automatic views/actions/resources, WebView, native crash capture, Replay, remote configuration, and symbol tooling vary. Treat every optional capability as platform- and version-gated. Read the platform reference and current official documentation before planning it.
+Core RUM is the default planning scope. Analyze Logs, Trace, Replay, WebView, native crash capture, remote configuration, and symbol tooling only when repository evidence shows the capability already exists or the user requests it. Treat every optional capability as platform- and version-gated; omit irrelevant sections instead of generating boilerplate decisions.

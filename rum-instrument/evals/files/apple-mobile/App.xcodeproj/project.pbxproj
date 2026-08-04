@@ -1,0 +1,14 @@
+/* Begin PBXNativeTarget section */
+IOS = {
+  isa = PBXNativeTarget;
+  name = PhoneApp;
+  productType = "com.apple.product-type.application";
+};
+TVOS = {
+  isa = PBXNativeTarget;
+  name = TVApp;
+  productType = "com.apple.product-type.application";
+};
+/* End PBXNativeTarget section */
+IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+TVOS_DEPLOYMENT_TARGET = 17.0;

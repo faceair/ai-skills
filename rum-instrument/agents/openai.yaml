@@ -1,4 +1,4 @@
 interface:
   display_name: "Guance RUM Instrumentation"
   short_description: "Plan and instrument every Guance RUM app type"
-  default_prompt: "Use $rum-instrument to detect every deployable RUM target in this repository, infer a safe Guance RUM profile from minimal appId and receiver variables, create an approval-gated plan, implement only an approved revision, and validate the resulting integration."
+  default_prompt: "Use $rum-instrument to detect every deployable RUM target in this repository, infer a safe Guance RUM profile from minimal appId and receiver variables, create and validate an intent-aware plan, continue ordinary core-RUM implementation when explicitly requested, pause for material review blockers, and validate the resulting integration."
