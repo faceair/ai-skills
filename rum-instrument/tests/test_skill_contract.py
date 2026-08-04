@@ -116,28 +116,34 @@ class SkillContractTests(unittest.TestCase):
         self.assertIn("getpass.getpass", helper)
         self.assertIn("--site-only", skill)
         self.assertIn("application lookup requires --client-token-env-file", helper)
-        self.assertIn("application lookup requires --metadata-file", helper)
+        self.assertIn("application lookup requires --state-file", helper)
+        self.assertIn("application lookup requires --plan-digest", helper)
         self.assertIn("--allow-external-secret-sink", helper)
         self.assertIn(
-            "removes the new secret sink if metadata persistence fails",
+            "removes the new secret sink if state persistence fails",
             skill,
         )
+        self.assertIn("credential-free HTTP reachability checks", skill)
+        self.assertIn("never poll for them", skill)
         self.assertNotIn("OWL_REGISTRY_ENDPOINT", helper)
         self.assertIn("use `OWL_REGISTRY_ENDPOINT`", control_plane)
 
-    def test_test_site_override_is_explicit_and_not_a_standard_prompt_field(self):
+    def test_testing_site_is_built_in_and_not_a_standard_prompt_field(self):
         skill = self.read("SKILL.md")
         control_plane = self.read("references/control-plane.md")
         validator = self.read("scripts/validate_contract.py")
 
         for value in (
-            "--test-site-catalog-file",
             "--insecure-test-tls",
-            "testing_override",
+            "builtin_testing",
+            "https://testing-ft2x-ai-api.dataflux.cn",
             "test_only",
         ):
             with self.subTest(value=value):
                 self.assertIn(value, skill + control_plane + validator)
+        for removed in ("--test-site-catalog-file", "testing_override"):
+            with self.subTest(removed=removed):
+                self.assertNotIn(removed, skill + control_plane + validator)
 
         minimal_contract = skill.split("## Minimal input contract", 1)[1].split(
             "## Workflow",
@@ -145,6 +151,7 @@ class SkillContractTests(unittest.TestCase):
         )[0]
         self.assertNotIn("aiApiEndpoint:", minimal_contract)
         self.assertNotIn("clientToken:", minimal_contract)
+        self.assertNotIn("evals/files", skill + control_plane)
 
     def test_headless_receiver_mode_is_absent(self):
         paths = [

@@ -64,20 +64,19 @@
     },
     {
       "id": 4,
-      "prompt": "使用 $rum-instrument 规划当前 Vue Web 仓库在隔离测试环境的观测云 RUM 接入。测试 DataWay 不在官方站点目录中，已提供本地测试目录；当前机器不信任测试 AI API 的证书链，允许仅本次测试跳过证书验证。\n\ndatawayUrl: http://testing-openway.dataflux.cn\nappId: testing_web_manage",
-      "expected_output": "规划阶段显式使用测试目录和测试 TLS 开关，只解析站点元数据，并在计划中隔离所有测试例外。",
+      "prompt": "使用 $rum-instrument 规划当前 Vue Web 仓库在隔离测试环境的观测云 RUM 接入。当前机器不信任测试 AI API 的证书链，允许仅本次测试跳过证书验证。\n\ndatawayUrl: http://testing-openway.dataflux.cn\nappId: testing_web_manage",
+      "expected_output": "规划阶段只使用内置测试站点和测试 TLS 开关解析站点元数据，并在计划中隔离所有测试例外。",
       "files": [
         "evals/files/vue-existing/package.json",
-        "evals/files/vue-existing/src/main.ts",
-        "evals/files/test-site-catalog.json"
+        "evals/files/vue-existing/src/main.ts"
       ],
       "expectations": [
         "标准 Prompt 不新增 clientToken 或 aiApiEndpoint 字段",
-        "仅通过 --test-site-catalog-file 启用自定义目录，并对 DataWay 做精确匹配",
-        "AI API 仍要求 HTTPS，--insecure-test-tls 只能与测试目录一起使用",
-        "计划记录 catalog=testing_override、status=catalog_resolved、test_only=true、目录来源和 TLS 验证状态",
+        "测试 DataWay 只映射到内置 https://testing-ft2x-ai-api.dataflux.cn，不读取 evals/ 或自定义目录",
+        "AI API 仍要求 HTTPS，--insecure-test-tls 只能用于内置测试站点",
+        "计划记录 catalog=builtin_testing、status=catalog_resolved、test_only=true 和 TLS 验证状态",
         "规划阶段不读取授权码、不调用应用 API，也不丢弃 Client Token",
-        "明确禁止把测试目录、TLS 例外或 HTTP DataWay 推广到生产"
+        "明确禁止把内置测试站点、TLS 例外或 HTTP DataWay 推广到生产"
       ]
     },
     {
@@ -141,25 +140,26 @@
         "request.intent 归一化为 implement，approval.status=approved、basis=explicit_implementation_request 且 blockers 为空",
         "先完成站点目录解析、仓库分析和 plan-phase validation，再消费临时授权码",
         "临时授权码在计划中只记录 prompt:provided，不出现在命令参数、文件、输出或最终报告",
-        "通过 stdin 调用 helper，获取的 Client Token 只写入已忽略且经过安全检查的运行时/构建配置 sink，并同时写入独立非敏感 metadata",
-        "application lookup 后把计划更新为 control_plane.status=resolved、Token availability=persisted，并记录 applicationType verification/api_value 后重新校验",
-        "不会为了例行 plan revision 再要求一次用户批准，而是在同一轮继续核心 RUM 接入",
+        "helper 在读取授权码前完成 DataWay、AI API 和输出路径的无凭据预检",
+        "通过 stdin 调用 helper，授权码只交换一次，每个 Application ID 只执行一次成功查询；仅瞬态网络失败可以重试",
+        "只以 token_expired=false 且 client_token 非空判断 Token 可用，sync/mapping 字段不触发轮询或阻塞",
+        "Client Token 只写入已忽略且经过安全检查的运行时/构建配置 sink，并同时写入绑定计划摘要的非敏感 execution state",
+        "application lookup 不把瞬态状态写回计划；control_plane.status、Token availability 和 plan revision 保持稳定",
         "识别既有初始化并收敛，不添加重复 SDK 或初始化器",
         "完成本地验证并生成 .rum/instrumentation.json，不把本地请求误报为远程上报成功"
       ]
     },
     {
       "id": 9,
-      "prompt": "使用 $rum-instrument 规划并实施当前 Vue Web 仓库在隔离测试环境的观测云 RUM 接入。测试 DataWay 不在官方站点目录中，已提供本地测试目录；允许仅本次测试跳过证书验证。\n\ndatawayUrl: http://testing-openway.dataflux.cn\nappId: testing_web_manage\ntemporaryAuthCode: eval-only-one-time-code",
-      "expected_output": "显式实施意图仍不能预授权测试目录和 TLS 例外；生成 pending 计划，记录 explicit_implementation_request basis 与具体 blockers，并在任何凭据交换或应用代码编辑前停止。",
+      "prompt": "使用 $rum-instrument 规划并实施当前 Vue Web 仓库在隔离测试环境的观测云 RUM 接入。允许仅本次测试跳过证书验证。\n\ndatawayUrl: http://testing-openway.dataflux.cn\nappId: testing_web_manage\ntemporaryAuthCode: eval-only-one-time-code",
+      "expected_output": "显式实施意图仍不能预授权内置测试站点和 TLS 例外；生成 pending 计划，记录 explicit_implementation_request basis 与具体 blockers，并在任何凭据交换或应用代码编辑前停止。",
       "files": [
         "evals/files/vue-existing/package.json",
-        "evals/files/vue-existing/src/main.ts",
-        "evals/files/test-site-catalog.json"
+        "evals/files/vue-existing/src/main.ts"
       ],
       "expectations": [
         "计划使用 schema v2，approval.status=pending、basis=explicit_implementation_request",
-        "approval.blockers 明确列出 testing control-plane override 和 disabled TLS verification",
+        "approval.blockers 明确列出 builtin testing site 和 disabled TLS verification",
         "不因 Prompt 中出现实施动词而绕过风险 Review",
         "停止前不消费临时授权码、不调用 /api/v1/rum/app/get、不修改应用代码",
         "Review 后只接受带 reviewed_plan_sha256 的 revision_review，并继续隔离测试例外，禁止进入生产配置"

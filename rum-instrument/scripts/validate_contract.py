@@ -78,7 +78,8 @@ CONTROL_PLANE_CATALOGS = {
     "https://urls.guance.com/",
     "https://urls.truewatch.com/",
 }
-TESTING_CONTROL_PLANE_CATALOG = "testing_override"
+TESTING_CONTROL_PLANE_CATALOG = "builtin_testing"
+TESTING_AI_API_ENDPOINT = "https://testing-ft2x-ai-api.dataflux.cn"
 TLS_VERIFICATION_MODES = {"verified", "disabled_for_testing"}
 CONTROL_PLANE_STATUSES = {"catalog_resolved", "resolved", "blocked"}
 CLIENT_TOKEN_AVAILABILITY = {"planned", "existing", "persisted"}
@@ -654,11 +655,11 @@ def validate_control_plane(value: Any, errors: list[str]) -> str | None:
         if catalog in CONTROL_PLANE_CATALOGS:
             if value.get("test_only") is True:
                 errors.append(
-                    f"{location}.test_only is valid only with catalog=testing_override"
+                    f"{location}.test_only is valid only with catalog=builtin_testing"
                 )
             if "catalog_source" in value:
                 errors.append(
-                    f"{location}.catalog_source is valid only with catalog=testing_override"
+                    f"{location}.catalog_source is not supported"
                 )
             if tls_verification != "verified":
                 errors.append(
@@ -667,30 +668,19 @@ def validate_control_plane(value: Any, errors: list[str]) -> str | None:
         elif catalog == TESTING_CONTROL_PLANE_CATALOG:
             if value.get("test_only") is not True:
                 errors.append(
-                    f"{location}.test_only must be true for catalog=testing_override"
+                    f"{location}.test_only must be true for catalog=builtin_testing"
                 )
-            catalog_source = value.get("catalog_source")
-            validate_source(
-                catalog_source,
-                f"{location}.catalog_source",
-                errors,
-                allow_literal=False,
-            )
-            source = (
-                catalog_source.get("source")
-                if isinstance(catalog_source, dict)
-                else None
-            )
-            if is_nonempty_string(source) and not (
-                is_valid_reference(source)
-                and source.startswith(("env:", "existing:"))
-            ):
+            if "catalog_source" in value:
                 errors.append(
-                    f"{location}.catalog_source.source must be an env: or existing: reference"
+                    f"{location}.catalog_source is not supported for the built-in testing site"
+                )
+            if value.get("site_code") != "testing":
+                errors.append(
+                    f"{location}.site_code must be testing for catalog=builtin_testing"
                 )
         else:
             errors.append(
-                f"{location}.catalog must be an official catalog URL or testing_override"
+                f"{location}.catalog must be an official catalog URL or builtin_testing"
             )
         if not is_nonempty_string(value.get("site_code")):
             errors.append(f"{location}.site_code must be a non-empty string")
@@ -714,6 +704,15 @@ def validate_control_plane(value: Any, errors: list[str]) -> str | None:
             f"{location}.ai_api_endpoint",
             errors,
         )
+        if (
+            catalog == TESTING_CONTROL_PLANE_CATALOG
+            and isinstance(ai_api_endpoint, dict)
+            and ai_api_endpoint.get("value") != TESTING_AI_API_ENDPOINT
+        ):
+            errors.append(
+                f"{location}.ai_api_endpoint.value must be "
+                f"{TESTING_AI_API_ENDPOINT} for catalog=builtin_testing"
+            )
         if value.get("exchange_path") != "/api/v1/account/accesskey/exchange":
             errors.append(
                 f"{location}.exchange_path must be /api/v1/account/accesskey/exchange"
@@ -1554,10 +1553,10 @@ def validate_plan(plan: Any, phase: str) -> tuple[list[str], list[str]]:
         if (
             phase == "implement"
             and receiver_mode == "public_dataway"
-            and control_plane_status != "resolved"
+            and control_plane_status not in {"catalog_resolved", "resolved"}
         ):
             errors.append(
-                "implementation requires control_plane.status=resolved for Public DataWay"
+                "implementation requires a resolved Public DataWay site"
             )
         if phase == "implement" and receiver_mode == "datakit":
             if datakit_readiness_status != "verified":
@@ -1571,6 +1570,165 @@ def validate_plan(plan: Any, phase: str) -> tuple[list[str], list[str]]:
             )
 
     validate_sensitive_values(plan, "", errors)
+    return errors, warnings
+
+
+def validate_control_plane_state(
+    state: Any,
+    plan: dict[str, Any],
+) -> tuple[list[str], list[str]]:
+    errors: list[str] = []
+    warnings: list[str] = []
+    if not isinstance(state, dict):
+        return ["control-plane state must be an object"], warnings
+    if state.get("schema_version") != 1:
+        errors.append("control-plane state schema_version must be 1")
+    if state.get("kind") != "rum_control_plane_state":
+        errors.append("control-plane state kind must be rum_control_plane_state")
+    if state.get("plan_digest") != plan_review_digest(plan):
+        errors.append("control-plane state plan_digest does not match this plan")
+
+    receiver = plan.get("request", {}).get("receiver", {})
+    control_plane = receiver.get("control_plane", {})
+    site = state.get("site")
+    if not isinstance(site, dict):
+        errors.append("control-plane state site must be an object")
+    else:
+        expected_ai_api = (
+            control_plane.get("ai_api_endpoint", {}).get("value")
+            if isinstance(control_plane, dict)
+            and isinstance(control_plane.get("ai_api_endpoint"), dict)
+            else None
+        )
+        for state_field, expected in (
+            ("catalog", control_plane.get("catalog") if isinstance(control_plane, dict) else None),
+            ("code", control_plane.get("site_code") if isinstance(control_plane, dict) else None),
+            ("ai_api", expected_ai_api),
+        ):
+            if site.get(state_field) != expected:
+                errors.append(
+                    f"control-plane state site.{state_field} does not match the plan"
+                )
+
+    network_preflight = state.get("network_preflight")
+    if (
+        not isinstance(network_preflight, dict)
+        or network_preflight.get("status") != "passed"
+    ):
+        errors.append("control-plane state requires a passed credential-free network preflight")
+    else:
+        for endpoint in ("dataway", "ai_api"):
+            result = network_preflight.get(endpoint)
+            if not isinstance(result, dict) or result.get("status") != "reachable":
+                errors.append(
+                    f"control-plane state network_preflight.{endpoint} must be reachable"
+                )
+
+    credential_resolution = state.get("credential_resolution")
+    if not isinstance(credential_resolution, dict):
+        errors.append("control-plane state credential_resolution must be an object")
+    else:
+        if credential_resolution.get("status") != "resolved":
+            errors.append("control-plane state credential_resolution.status must be resolved")
+        if credential_resolution.get("api_key_persistence") != "memory_only":
+            errors.append(
+                "control-plane state credential_resolution.api_key_persistence must be memory_only"
+            )
+
+    expected_tokens = receiver.get("client_tokens")
+    expected_slots = set(expected_tokens) if isinstance(expected_tokens, dict) else set()
+    state_tokens = state.get("client_tokens")
+    if not isinstance(state_tokens, dict):
+        errors.append("control-plane state client_tokens must be an object")
+        state_tokens = {}
+    if set(state_tokens) != expected_slots:
+        errors.append("control-plane state client token slots do not match the plan")
+    for slot in sorted(expected_slots & set(state_tokens)):
+        expected_reference = expected_tokens.get(slot)
+        state_reference = state_tokens.get(slot)
+        if not isinstance(state_reference, dict):
+            errors.append(f"control-plane state client_tokens.{slot} must be an object")
+            continue
+        if (
+            not isinstance(expected_reference, dict)
+            or state_reference.get("source") != expected_reference.get("source")
+        ):
+            errors.append(
+                f"control-plane state client_tokens.{slot}.source does not match the plan"
+            )
+        if state_reference.get("availability") != "persisted":
+            errors.append(
+                f"control-plane state client_tokens.{slot}.availability must be persisted"
+            )
+
+    plan_types: dict[str, dict[str, Any]] = {}
+    for target in plan.get("targets", []):
+        if not isinstance(target, dict) or target.get("disposition") != "planned":
+            continue
+        application_types = target.get("application_types")
+        if not isinstance(application_types, dict):
+            continue
+        for slot, descriptor in application_types.items():
+            if slot in plan_types and plan_types[slot] != descriptor:
+                errors.append(
+                    f"plan contains conflicting application type descriptors for slot {slot}"
+                )
+            elif isinstance(descriptor, dict):
+                plan_types[slot] = descriptor
+
+    applications = state.get("applications")
+    if not isinstance(applications, dict):
+        errors.append("control-plane state applications must be an object")
+        applications = {}
+    if set(applications) != expected_slots:
+        errors.append("control-plane state application slots do not match the plan")
+    approval = plan.get("approval")
+    revision_reviewed = (
+        isinstance(approval, dict)
+        and approval.get("basis") == "revision_review"
+        and approval.get("status") == "approved"
+    )
+    for slot in sorted(expected_slots & set(applications)):
+        application = applications.get(slot)
+        if not isinstance(application, dict):
+            errors.append(f"control-plane state applications.{slot} must be an object")
+            continue
+        if application.get("token_expired") is not False:
+            errors.append(
+                f"control-plane state applications.{slot}.token_expired must be false"
+            )
+        if application.get("client_token_available") is not True:
+            errors.append(
+                f"control-plane state applications.{slot}.client_token_available must be true"
+            )
+        api_type = application.get("api_app_type")
+        if api_type not in APPLICATION_TYPES:
+            errors.append(
+                f"control-plane state applications.{slot}.api_app_type is unsupported"
+            )
+            continue
+        descriptor = plan_types.get(slot)
+        if not isinstance(descriptor, dict):
+            errors.append(
+                f"control-plane state applications.{slot} has no planned application type"
+            )
+            continue
+        planned_type = descriptor.get("value")
+        if api_type == planned_type:
+            continue
+        accepted_mismatch = (
+            descriptor.get("source") == "user"
+            and descriptor.get("verification") == "mismatched"
+            and descriptor.get("api_value") == api_type
+            and revision_reviewed
+        )
+        if not accepted_mismatch:
+            errors.append(
+                f"control-plane state applications.{slot}.api_app_type differs from "
+                "the planned application type; revise and review the plan"
+            )
+
+    validate_sensitive_values(state, "control_plane_state", errors)
     return errors, warnings
 
 
@@ -2001,6 +2159,11 @@ def main() -> int:
     parser.add_argument("--phase", choices=("plan", "implement"), default="plan")
     parser.add_argument("--repository", type=Path)
     parser.add_argument(
+        "--execution-state",
+        type=Path,
+        help="non-secret control-plane state produced by resolve_rum_application.py",
+    )
+    parser.add_argument(
         "--print-review-digest",
         action="store_true",
         help="print the canonical digest to record for revision_review",
@@ -2020,6 +2183,18 @@ def main() -> int:
         print(plan_review_digest(document))
         return 0
 
+    execution_state = None
+    if arguments.execution_state is not None:
+        try:
+            execution_state = json.loads(
+                arguments.execution_state.read_text(encoding="utf-8")
+            )
+        except OSError as error:
+            parser.error(str(error))
+        except json.JSONDecodeError as error:
+            print(f"invalid execution-state JSON: {error}", file=sys.stderr)
+            return 1
+
     kind = arguments.kind
     if kind == "auto":
         kind = (
@@ -2033,8 +2208,12 @@ def main() -> int:
             parser.error("--phase is valid only for plan documents")
         if arguments.repository is not None:
             parser.error("--repository is valid only for plan implementation validation")
+        if arguments.execution_state is not None:
+            parser.error("--execution-state is valid only for plan implementation validation")
         errors, warnings = validate_inventory(document)
     else:
+        if arguments.phase != "implement" and arguments.execution_state is not None:
+            parser.error("--execution-state requires --phase implement")
         errors, warnings = validate_plan(document, arguments.phase)
         if arguments.phase == "implement":
             if arguments.repository is None:
@@ -2043,6 +2222,23 @@ def main() -> int:
                 errors.extend(
                     validate_repository_state(document, arguments.repository)
                 )
+            receiver_mode = (
+                document.get("request", {}).get("receiver", {}).get("mode")
+                if isinstance(document, dict)
+                else None
+            )
+            if receiver_mode == "public_dataway":
+                if execution_state is None:
+                    errors.append(
+                        "Public DataWay implementation requires --execution-state"
+                    )
+                else:
+                    state_errors, state_warnings = validate_control_plane_state(
+                        execution_state,
+                        document,
+                    )
+                    errors.extend(state_errors)
+                    warnings.extend(state_warnings)
     for warning in warnings:
         print(f"warning: {warning}", file=sys.stderr)
     if errors:

@@ -43,6 +43,7 @@ TRUEWATCH_CATALOG = {
         }
     }
 }
+PLAN_DIGEST = "sha256:" + "a" * 64
 
 
 def catalog_fetcher(url: str):
@@ -86,56 +87,39 @@ class ResolveRumApplicationTests(unittest.TestCase):
         self.assertEqual(("truewatch", "us1"), (truewatch.brand, truewatch.code))
         self.assertEqual("https://us1-ai-api.truewatch.com", truewatch.ai_api_url)
 
-    def test_resolves_exact_match_from_explicit_test_catalog_file(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            catalog = Path(temporary) / "testing-sites.json"
-            catalog.write_text(
-                json.dumps(
-                    {
-                        "urls": {
-                            "testing": {
-                                "openway": "http://testing-openway.dataflux.cn",
-                                "ai_api": "https://testing-ft2x-ai-api.dataflux.cn",
-                            }
-                        }
-                    }
-                ),
-                encoding="utf-8",
-            )
+    def test_resolves_only_the_built_in_testing_site(self):
+        site = RESOLVER.resolve_site(
+            "http://testing-openway.dataflux.cn",
+            catalog_fetcher=mock.Mock(side_effect=AssertionError("catalog must not load")),
+        )
 
-            site = RESOLVER.resolve_test_site(
-                "http://testing-openway.dataflux.cn",
-                catalog,
-                insecure_test_tls=True,
-            )
-
-        self.assertEqual(("testing", "testing"), (site.brand, site.code))
-        self.assertEqual("testing_override", site.catalog_kind)
-        self.assertEqual("disabled_for_testing", site.tls_verification)
+        self.assertEqual(("guance", "testing"), (site.brand, site.code))
+        self.assertEqual("testing", site.catalog_kind)
+        self.assertEqual("builtin_testing", site.catalog_url)
         self.assertEqual(
             "https://testing-ft2x-ai-api.dataflux.cn",
             site.ai_api_url,
         )
 
-    def test_insecure_tls_requires_explicit_test_catalog_override(self):
+    def test_insecure_tls_is_scoped_to_the_built_in_testing_site(self):
         self.assertIsNone(
             RESOLVER.build_ai_api_tls_context(
                 insecure_test_tls=False,
-                testing_override=False,
+                testing_site=False,
             )
         )
         with self.assertRaisesRegex(
             RESOLVER.ResolutionError,
-            "--test-site-catalog-file",
+            "built-in testing site",
         ):
             RESOLVER.build_ai_api_tls_context(
                 insecure_test_tls=True,
-                testing_override=False,
+                testing_site=False,
             )
 
         context = RESOLVER.build_ai_api_tls_context(
             insecure_test_tls=True,
-            testing_override=True,
+            testing_site=True,
         )
         self.assertIsNotNone(context)
         self.assertEqual(ssl.CERT_NONE, context.verify_mode)
@@ -259,6 +243,7 @@ class ResolveRumApplicationTests(unittest.TestCase):
             )
             result = RESOLVER.build_safe_result(
                 {"application": {"app_id": "demo"}},
+                plan_digest=PLAN_DIGEST,
                 client_token_environments={
                     "default": "GUANCE_RUM_CLIENT_TOKEN"
                 },
@@ -317,7 +302,7 @@ class ResolveRumApplicationTests(unittest.TestCase):
         )
         self.assertNotIn("client-token", str(metadata))
 
-    def test_retries_until_application_mapping_is_ready(self):
+    def test_accepts_a_valid_token_without_waiting_for_mapping(self):
         site = RESOLVER.Site(
             brand="guance",
             code="default",
@@ -353,10 +338,84 @@ class ResolveRumApplicationTests(unittest.TestCase):
             sleeper=sleeper,
         )
 
+        self.assertEqual(1, lookups)
+        sleeper.assert_not_called()
+        self.assertEqual({"web": "client-token"}, tokens)
+        application = metadata["applications"]["web"]
+        self.assertTrue(application["client_token_available"])
+        self.assertEqual("pending", application["observations"]["mapping_status"])
+        self.assertFalse(application["observations"]["mapping_ready"])
+
+    def test_retries_only_transient_application_lookup_failures(self):
+        site = RESOLVER.Site(
+            brand="guance",
+            code="default",
+            catalog_url="https://urls.guance.com/",
+            dataway_url="https://openway.guance.com",
+            ai_api_url="https://ai-api.guance.com",
+        )
+        lookups = 0
+
+        def poster(url, body, headers, operation):
+            nonlocal lookups
+            if url.endswith(RESOLVER.EXCHANGE_PATH):
+                return {"success": True, "data": {"item": {"sk": "api-key"}}}
+            lookups += 1
+            if lookups == 1:
+                raise RESOLVER.TransientResolutionError("temporary network failure")
+            return {
+                "success": True,
+                "data": {
+                    "item": ready_application("web_app", "web", "client-token")
+                },
+            }
+
+        sleeper = mock.Mock()
+        metadata, tokens = RESOLVER.resolve_applications(
+            site,
+            {"web": "web_app"},
+            "temporary-code",
+            json_poster=poster,
+            retry_delay=0,
+            sleeper=sleeper,
+        )
+
         self.assertEqual(2, lookups)
         sleeper.assert_called_once_with(0)
         self.assertEqual({"web": "client-token"}, tokens)
-        self.assertTrue(metadata["applications"]["web"]["mapping_ready"])
+        self.assertEqual(2, metadata["applications"]["web"]["network_attempts"])
+
+    def test_sync_and_mapping_failures_do_not_invalidate_a_current_token(self):
+        site = RESOLVER.Site(
+            brand="guance",
+            code="default",
+            catalog_url="https://urls.guance.com/",
+            dataway_url="https://openway.guance.com",
+            ai_api_url="https://ai-api.guance.com",
+        )
+
+        def poster(url, body, headers, operation):
+            if url.endswith(RESOLVER.EXCHANGE_PATH):
+                return {"success": True, "data": {"item": {"sk": "api-key"}}}
+            item = ready_application("web_app", "web", "client-token")
+            item.update(
+                {
+                    "client_token_sync_status": "failed",
+                    "mapping_status": "failed",
+                    "mapping_ready": False,
+                }
+            )
+            return {"success": True, "data": {"item": item}}
+
+        metadata, tokens = RESOLVER.resolve_applications(
+            site,
+            {"web": "web_app"},
+            "temporary-code",
+            json_poster=poster,
+        )
+
+        self.assertEqual({"web": "client-token"}, tokens)
+        self.assertTrue(metadata["applications"]["web"]["client_token_available"])
 
     def test_rejects_expired_or_failed_client_token_state(self):
         site = RESOLVER.Site(
@@ -456,9 +515,14 @@ class ResolveRumApplicationTests(unittest.TestCase):
             repository.mkdir()
             self.init_git(repository)
             secret_file = Path(temporary) / "client-token.env"
-            metadata_file = Path(temporary) / "resolution.json"
+            state_file = Path(temporary) / "control-plane-state.json"
             with (
                 mock.patch.object(RESOLVER, "resolve_site", return_value=site),
+                mock.patch.object(
+                    RESOLVER,
+                    "preflight_site",
+                    return_value={"status": "passed"},
+                ),
                 mock.patch.object(
                     RESOLVER,
                     "resolve_applications",
@@ -477,8 +541,10 @@ class ResolveRumApplicationTests(unittest.TestCase):
                         "--temporary-auth-code-stdin",
                         "--client-token-env-file",
                         str(secret_file),
-                        "--metadata-file",
-                        str(metadata_file),
+                        "--state-file",
+                        str(state_file),
+                        "--plan-digest",
+                        PLAN_DIGEST,
                         "--allow-external-secret-sink",
                         "--repository",
                         str(repository),
@@ -525,7 +591,7 @@ class ResolveRumApplicationTests(unittest.TestCase):
         read_code.assert_not_called()
         self.assertIn("Client Token is not discarded", stderr.getvalue())
 
-    def test_cli_requires_metadata_sink_before_catalog_or_code_access(self):
+    def test_cli_requires_state_sink_before_catalog_or_code_access(self):
         stderr = io.StringIO()
         with tempfile.TemporaryDirectory() as temporary:
             repository = Path(temporary)
@@ -558,9 +624,9 @@ class ResolveRumApplicationTests(unittest.TestCase):
         self.assertEqual(1, result)
         resolve_site.assert_not_called()
         read_code.assert_not_called()
-        self.assertIn("requires --metadata-file", stderr.getvalue())
+        self.assertIn("requires --state-file", stderr.getvalue())
 
-    def test_metadata_failure_rolls_back_new_secret_sink(self):
+    def test_state_failure_rolls_back_new_secret_sink(self):
         site = RESOLVER.Site(
             brand="guance",
             code="default",
@@ -590,10 +656,15 @@ class ResolveRumApplicationTests(unittest.TestCase):
             self.init_git(repository)
             (repository / ".gitignore").write_text(".rum/\n", encoding="utf-8")
             secret_file = repository / ".rum" / "client-token.env"
-            metadata_file = repository / ".rum" / "resolution.json"
+            state_file = repository / ".rum" / "control-plane-state.json"
             stderr = io.StringIO()
             with (
                 mock.patch.object(RESOLVER, "resolve_site", return_value=site),
+                mock.patch.object(
+                    RESOLVER,
+                    "preflight_site",
+                    return_value={"status": "passed"},
+                ),
                 mock.patch.object(
                     RESOLVER,
                     "resolve_applications",
@@ -601,9 +672,9 @@ class ResolveRumApplicationTests(unittest.TestCase):
                 ),
                 mock.patch.object(
                     RESOLVER,
-                    "write_metadata_file",
+                    "write_state_file",
                     side_effect=RESOLVER.ResolutionError(
-                        "metadata file could not be created safely"
+                        "control-plane state file could not be created safely"
                     ),
                 ),
                 mock.patch.object(sys, "stdin", io.StringIO("synthetic-code\n")),
@@ -619,8 +690,10 @@ class ResolveRumApplicationTests(unittest.TestCase):
                         "--temporary-auth-code-stdin",
                         "--client-token-env-file",
                         str(secret_file),
-                        "--metadata-file",
-                        str(metadata_file),
+                        "--state-file",
+                        str(state_file),
+                        "--plan-digest",
+                        PLAN_DIGEST,
                         "--repository",
                         str(repository),
                     ],
@@ -631,7 +704,60 @@ class ResolveRumApplicationTests(unittest.TestCase):
 
             self.assertEqual(1, result)
             self.assertFalse(secret_file.exists())
-            self.assertIn("metadata file could not be created", stderr.getvalue())
+            self.assertIn("control-plane state file could not be created", stderr.getvalue())
+
+    def test_network_preflight_runs_before_authorization_code_is_read(self):
+        site = RESOLVER.Site(
+            brand="guance",
+            code="default",
+            catalog_url="https://urls.guance.com/",
+            dataway_url="https://openway.guance.com",
+            ai_api_url="https://ai-api.guance.com",
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            repository = Path(temporary)
+            self.init_git(repository)
+            (repository / ".gitignore").write_text(".rum/\n", encoding="utf-8")
+            stderr = io.StringIO()
+            with (
+                mock.patch.object(RESOLVER, "resolve_site", return_value=site),
+                mock.patch.object(
+                    RESOLVER,
+                    "preflight_site",
+                    side_effect=RESOLVER.ResolutionError("network preflight failed"),
+                ) as preflight,
+                mock.patch.object(
+                    RESOLVER,
+                    "read_temporary_authorization_code",
+                ) as read_code,
+                mock.patch.object(
+                    sys,
+                    "argv",
+                    [
+                        str(SCRIPT),
+                        "--dataway-url",
+                        "https://openway.guance.com",
+                        "--app-id",
+                        "web_demo",
+                        "--temporary-auth-code-stdin",
+                        "--client-token-env-file",
+                        str(repository / ".rum" / "client-token.env"),
+                        "--state-file",
+                        str(repository / ".rum" / "control-plane-state.json"),
+                        "--plan-digest",
+                        PLAN_DIGEST,
+                        "--repository",
+                        str(repository),
+                    ],
+                ),
+                redirect_stderr(stderr),
+            ):
+                result = RESOLVER.main()
+
+        self.assertEqual(1, result)
+        preflight.assert_called_once()
+        read_code.assert_not_called()
+        self.assertIn("network preflight failed", stderr.getvalue())
 
     def test_environment_source_remains_supported_for_automation(self):
         temporary_code = "  synthetic-environment-code  "
@@ -716,7 +842,7 @@ class ResolveRumApplicationTests(unittest.TestCase):
     def test_cli_requires_repository_for_client_token_file(self):
         with tempfile.TemporaryDirectory() as temporary:
             output = Path(temporary) / "token.env"
-            metadata = Path(temporary) / "resolution.json"
+            state = Path(temporary) / "control-plane-state.json"
             stderr = io.StringIO()
             with (
                 mock.patch.object(RESOLVER, "resolve_site") as resolve_site,
@@ -731,8 +857,10 @@ class ResolveRumApplicationTests(unittest.TestCase):
                         "web_demo",
                         "--client-token-env-file",
                         str(output),
-                        "--metadata-file",
-                        str(metadata),
+                        "--state-file",
+                        str(state),
+                        "--plan-digest",
+                        PLAN_DIGEST,
                     ],
                 ),
                 redirect_stderr(stderr),
@@ -743,7 +871,7 @@ class ResolveRumApplicationTests(unittest.TestCase):
         resolve_site.assert_not_called()
         self.assertIn("requires --repository", stderr.getvalue())
 
-    def test_cli_rejects_metadata_and_secret_path_collision(self):
+    def test_cli_rejects_state_and_secret_path_collision(self):
         with tempfile.TemporaryDirectory() as temporary:
             repository = Path(temporary) / "repository"
             repository.mkdir()
@@ -764,8 +892,10 @@ class ResolveRumApplicationTests(unittest.TestCase):
                         str(shared),
                         "--repository",
                         str(repository),
-                        "--metadata-file",
+                        "--state-file",
                         str(shared),
+                        "--plan-digest",
+                        PLAN_DIGEST,
                     ],
                 ),
                 redirect_stderr(stderr),
@@ -800,7 +930,7 @@ class ResolveRumApplicationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             output = Path(temporary) / "existing.env"
             output.write_text("existing-content\n", encoding="utf-8")
-            metadata = Path(temporary) / "resolution.json"
+            state = Path(temporary) / "control-plane-state.json"
             stderr = io.StringIO()
             with (
                 mock.patch.object(RESOLVER, "resolve_site") as resolve_site,
@@ -815,8 +945,10 @@ class ResolveRumApplicationTests(unittest.TestCase):
                         "web_demo",
                         "--client-token-env-file",
                         str(output),
-                        "--metadata-file",
-                        str(metadata),
+                        "--state-file",
+                        str(state),
+                        "--plan-digest",
+                        PLAN_DIGEST,
                     ],
                 ),
                 redirect_stderr(stderr),

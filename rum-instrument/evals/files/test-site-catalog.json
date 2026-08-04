@@ -1,8 +1,0 @@
-{
-  "urls": {
-    "testing": {
-      "openway": "http://testing-openway.dataflux.cn",
-      "ai_api": "https://testing-ai-api.dataflux.cn"
-    }
-  }
-}

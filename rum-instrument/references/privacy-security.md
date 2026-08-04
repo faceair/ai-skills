@@ -23,9 +23,9 @@ Application IDs and receiver URLs are configuration. A temporary authorization c
 - route the Client Token directly to a reviewed environment-assignment/build configuration sink;
 - preserve only the redacted `prompt:provided` marker, `env:`, `runtime:`, or existing configuration references in plans and reports;
 - do not echo, print, diff, stage, screenshot, or otherwise inspect credential values or the generated secret file;
-- never place a real authorization code, API Key, or Client Token in command arguments, tracked source, fixtures, logs, or metadata.
+- never place a real authorization code, API Key, or Client Token in command arguments, tracked source, fixtures, logs, or execution state.
 
-The helper refuses to overwrite a restricted configuration file, requires separate recoverable metadata, rolls back a newly written Client Token sink if metadata persistence fails, and refuses an in-repository sink that Git does not ignore. Its dotenv-shaped output does not justify adding a dotenv loader to native code. If the repository has no safe existing runtime/build-time injection source, keep implementation blocked and leave value injection to the human deployment system.
+The helper refuses to overwrite a restricted configuration file, requires separate digest-bound recoverable state, rolls back a newly written Client Token sink if state persistence fails, and refuses in-repository Token/state files that Git does not ignore. Its dotenv-shaped output does not justify adding a dotenv loader to native code. If the repository has no safe existing runtime/build-time injection source, keep implementation blocked and leave value injection to the human deployment system.
 
 An insecure TLS context is permitted only for an explicitly approved test-site catalog. Keep that context scoped to AI API requests in the helper, preserve verified TLS for official catalogs, and never persist certificate errors or credential-bearing response content.
 

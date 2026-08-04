@@ -23,7 +23,7 @@ Treat `temporaryAuthCode` as transient implementation input. It is optional duri
 
 For Public DataWay, use [control-plane.md](control-plane.md) and the bundled helper. Store the resolved Client Token only as a structured `env:`, `runtime:`, or `existing:` configuration reference. Environment references use uppercase environment-style names; runtime references are environment names or dotted configuration paths; existing references identify a concrete path/key. A `template:CLIENT_TOKEN` source and a token-like literal disguised after `runtime:` are invalid.
 
-An explicitly approved test-site catalog is execution metadata, not a standard Prompt field. Record it as `catalog: testing_override`, keep its location as an `env:` or `existing:` source reference, and mark the control-plane resolution `test_only`.
+The only test-site mapping is built into the helper: `http://testing-openway.dataflux.cn` uses `https://testing-ft2x-ai-api.dataflux.cn`. Record it as `catalog: builtin_testing` and `test_only: true`. Never load operational site configuration from `evals/`, accept a testing AI API input, or derive another endpoint.
 
 Record whether `appId` was supplied as a scalar or map in `request.application_id_input`; this preserves enough provenance for deterministic cardinality validation without storing a secret.
 

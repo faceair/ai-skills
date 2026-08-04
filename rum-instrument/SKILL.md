@@ -120,7 +120,7 @@ python3 <skill-dir>/scripts/resolve_rum_application.py \
   --site-only
 ```
 
-This verifies the exact `openway` match and records the catalog-provided AI API without consuming credentials. Never derive AI API from Owl or hostname rewriting. Keep non-production catalog and TLS exceptions in [references/control-plane.md](references/control-plane.md); use them only after explicit test authorization.
+This verifies the exact `openway` match and records the catalog-provided AI API without consuming credentials. Never derive AI API from Owl or hostname rewriting. The only built-in testing mapping is `http://testing-openway.dataflux.cn` to `https://testing-ft2x-ai-api.dataflux.cn`; do not load operational site configuration from `evals/` or accept another testing AI API.
 
 During authorized implementation, call the application API once and write its Client Token directly to the reviewed runtime sink:
 
@@ -131,19 +131,22 @@ python3 <skill-dir>/scripts/resolve_rum_application.py \
   --temporary-auth-code-stdin \
   --client-token-env <slot>=<repository-specific-runtime-variable> \
   --client-token-env-file <already-git-ignored-secret-file> \
-  --metadata-file <new-non-secret-resolution-json> \
+  --state-file <new-git-ignored-control-plane-state-json> \
+  --plan-digest <validate-contract-review-digest> \
   --repository <repository-root>
 ```
 
 For direct Prompt input, send the code through the subprocess stdin channel without embedding it in the shell command; use `--temporary-auth-code-env NAME` only for automation. For a scalar app, omit `<slot>=` from `--client-token-env`. For a map, repeat `--app-id`, `--application-type`, and `--client-token-env` per repository-wide unique slot.
 
-The helper exchanges the code once, validates that the Client Token is not expired and that token synchronization and application mapping are ready, then transactionally writes a new mode-`0600` environment-assignment sink and a separate non-secret metadata file. It requires both outputs, requires `--repository`, rejects a non-ignored in-repository sink, requires `--allow-external-secret-sink` for a reviewed external sink, refuses output-path collisions, and removes the new secret sink if metadata persistence fails. Do not open, print, diff, stage, or inspect the generated secret file.
+Before reading the code, the helper verifies the secret/state destinations and performs credential-free HTTP reachability checks for the exact DataWay and AI API origins. It then exchanges the code once and calls `/api/v1/rum/app/get` once per Application ID. A lookup is successful only when `token_expired` is exactly `false` and `client_token` is present and non-empty. `client_token_sync_status`, `mapping_status`, and `mapping_ready` are optional observations: never use them as Token or implementation gates and never poll for them. Retry only transient network failures of the idempotent application lookup; do not automatically retry the one-time code exchange.
 
-Read only the non-secret metadata file. Update the same plan to `control_plane.status: resolved`, mark Client Token references `persisted`, and set each application type to `matched` or `mismatched` with `api_value`. User-defined type remains the selected value; without one, the AI API value takes precedence over repository inference. Revalidate the resolved plan before any application-code edit. A mismatch or another material change requires Revision Review.
+The helper transactionally writes a new mode-`0600` environment-assignment sink and a separate non-secret control-plane state file bound to the canonical plan digest. It requires both outputs and `--repository`, rejects non-ignored in-repository outputs, requires `--allow-external-secret-sink` for a reviewed external Token sink, refuses output-path collisions, and removes the new secret sink if state persistence fails. Do not open, print, diff, stage, or inspect the generated secret file.
+
+Read only the non-secret state file. Keep `.rum/plan.json` stable: network reachability, authorization-code consumption, Token persistence, lookup attempts, and optional sync/mapping observations never change its revision or Review digest. Update the plan only when AI API application type changes the selected adapter/edit set or exposes a user-type mismatch; that is a material change requiring Revision Review. User-defined type remains selected, otherwise AI API metadata takes precedence over repository inference.
 
 The helper's dotenv-shaped output is a transport into an existing reviewed runtime/build configuration path, not proof that every platform supports process environment variables. Do not add a new dotenv loader or embed the value into native source merely to consume it. If the repository lacks a safe existing build/runtime injection path, keep implementation blocked and hand off value injection.
 
-On a convergent rerun, preserve an existing reviewed runtime Client Token source and do not invoke the helper again. Recover application metadata from the non-secret metadata file. Its preflight rejects an existing secret sink before reading the temporary-code environment variable or making a network request.
+On a convergent rerun, preserve an existing reviewed runtime Client Token source and its matching control-plane state. Do not invoke the helper again. Its local preflight rejects an existing sink before resolving a site, reading the temporary-code input, or making a network request.
 
 ### 3. Detect all targets
 
@@ -175,7 +178,7 @@ Analyze Logs, Trace, Replay, WebView, native crash/ANR/freeze/UI-block capture, 
 
 ### 6. Create and authorize the plan
 
-Write `.rum/plan.json` according to [references/contracts.md](references/contracts.md). Initial Public DataWay plans use `control_plane.status: catalog_resolved` and mark new runtime Client Token references `availability: planned`; preserve an already reviewed sink as `availability: existing`. Authorized implementation updates the plan to `resolved` from the helper's non-secret metadata before code edits. Include the target graph, exact planned files, core receiver/profile decisions, applicable advanced decisions, validation, risks, rollback, and intent-aware approval.
+Write `.rum/plan.json` according to [references/contracts.md](references/contracts.md). Public DataWay plans keep `control_plane.status: catalog_resolved` and mark new runtime Client Token references `availability: planned`; preserve an already reviewed sink as `availability: existing`. Runtime resolution is recorded only in the separate control-plane state. Include the target graph, exact planned files, core receiver/profile decisions, applicable advanced decisions, validation, risks, rollback, and intent-aware approval.
 
 Choose the approval object from the user's intent:
 
@@ -183,7 +186,7 @@ Choose the approval object from the user's intent:
 - Explicit implementation or repair with ordinary core-RUM changes: `status: approved`, `basis: explicit_implementation_request`, `blockers: []`. Validate, then continue directly to step 7 in the same run.
 - Explicit implementation with a material review condition: `status: pending`, `basis: explicit_implementation_request`, and concrete `blockers`. Validate, summarize the decision needed, and stop.
 
-Material review conditions include ambiguous Application IDs, application-type conflict, dirty overlap, SDK upgrade/replacement/removal, any new optional signal (including Logs/Trace/Replay/WebView/native crash/ANR/freeze/UI-block/Remote Config/Canvas Replay), release-artifact scope, test catalog/TLS exceptions, an unsafe Token sink, remote mutations, and material target/file/behavior drift. Record optional capabilities in `profile.signals`, their existing baseline in `existing_instrumentation.signals`, and release decisions in `artifacts`; the contract validator uses those structured fields to prevent explicit implementation intent from bypassing Review. Follow the complete list in [references/execution.md](references/execution.md).
+Material review conditions include ambiguous Application IDs, application-type conflict, dirty overlap, SDK upgrade/replacement/removal, any new optional signal (including Logs/Trace/Replay/WebView/native crash/ANR/freeze/UI-block/Remote Config/Canvas Replay), release-artifact scope, the built-in testing site or disabled TLS verification, an unsafe Token sink, remote mutations, and material target/file/behavior drift. Record optional capabilities in `profile.signals`, their existing baseline in `existing_instrumentation.signals`, and release decisions in `artifacts`; the contract validator uses those structured fields to prevent explicit implementation intent from bypassing Review. Follow the complete list in [references/execution.md](references/execution.md).
 
 Run:
 
@@ -191,7 +194,7 @@ Run:
 python3 <skill-dir>/scripts/validate_contract.py .rum/plan.json
 ```
 
-Every authorization is bound to the validated revision and exact edit set. For Revision Review, record `approval.reviewed_plan_sha256` from `validate_contract.py .rum/plan.json --print-review-digest` and `reviewed_overlaps` as defined in the contract. Increment the revision and require `revision_review` when targets, files, receiver mode, SDK choice, signals, privacy behavior, or artifact handling changes materially. Do not pause a normal explicit implementation request merely because the plan artifact was just created.
+Every authorization is bound to the validated revision and exact edit set. After finalizing the authorized plan, obtain its non-secret digest with `validate_contract.py .rum/plan.json --print-review-digest` and pass that exact value to the helper's `--plan-digest`. For Revision Review, also store it in `approval.reviewed_plan_sha256` with `reviewed_overlaps` as defined in the contract. Increment the revision and require `revision_review` when targets, files, receiver mode, SDK choice, signals, privacy behavior, or artifact handling changes materially. Do not pause a normal explicit implementation request merely because the plan artifact was just created.
 
 ### 7. Implement an authorized revision
 
@@ -200,12 +203,13 @@ Before editing, verify repository identity, commit, dirty-file overlap, target e
 ```bash
 python3 <skill-dir>/scripts/validate_contract.py .rum/plan.json \
   --phase implement \
+  --execution-state <git-ignored-control-plane-state-json> \
   --repository <repository-root>
 ```
 
 Implement in target-sized batches. Edit canonical source and runtime configuration, never generated output. Preserve existing config precedence, application lifecycle, networking behavior, request signing, and user consent flows. Do not duplicate native and framework initialization.
 
-For Public DataWay, implementation remains blocked until the helper result is persisted, `control_plane.status` is `resolved`, every application type is verified, and the reviewed runtime Client Token source exists. Obtain it only with the helper workflow above, after plan validation. DataKit implementation must not request a temporary code, resolve an AI API endpoint, or add a Client Token field; it also remains blocked until the RUM collector and runtime-to-DataKit network reachability are both verified with evidence.
+For Public DataWay, implementation remains blocked until the digest-bound execution state proves credential-free preflight passed, `token_expired` is false, a Client Token is safely persisted, and the API application type matches the stable plan or an exact mismatch revision was reviewed. Sync and mapping observations never block implementation. DataKit implementation must not request a temporary code, resolve an AI API endpoint, or add a Client Token field; it also remains blocked until the RUM collector and runtime-to-DataKit network reachability are both verified with evidence.
 
 If a newly discovered fact materially changes the authorized edit set, stop, revise the plan, and obtain revision review before continuing.
 
