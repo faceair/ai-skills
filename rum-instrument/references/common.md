@@ -19,7 +19,7 @@ Normalize sources:
 - an existing repository variable → `existing:<path>#<config-key>`
 - a literal non-secret URL/Application ID → a plan value with provenance `user`
 
-Treat `temporaryAuthCode` as transient implementation input. It is optional during planning and must not be consumed before plan-phase validation and implementation authorization. Direct Prompt input is the default user path for a one-Prompt implementation; `env:GUANCE_TEMP_AUTH_CODE` remains available for automation. Never store or repeat the literal value in a plan, command argument, tracked file, tool commentary, or response.
+Treat `temporaryAuthCode` as transient implementation input. It is optional during planning and must not be consumed before plan-phase validation and implementation authorization. Direct Prompt input is the default user path for a one-Prompt implementation; `env:RUM_TEMP_AUTH_CODE` remains available for automation. Never store or repeat the literal value in a plan, command argument, tracked file, tool commentary, or response.
 
 For Public DataWay, use [control-plane.md](control-plane.md) and the bundled helper. Store the resolved Client Token only as a structured `env:`, `runtime:`, or `existing:` configuration reference. Environment references use uppercase environment-style names; runtime references are environment names or dotted configuration paths; existing references identify a concrete path/key. A `template:CLIENT_TOKEN` source and a token-like literal disguised after `runtime:` are invalid.
 
@@ -118,7 +118,7 @@ Do not freeze a guessed production environment, local Git commit, developer mach
 
 ## Existing-integration convergence
 
-Search manifests and source for Guance SDK packages, `DATAFLUX_RUM`, `datafluxRum`, `FTMobileSDK`, `FTSDK`, RUM configuration builders, Session Replay calls, custom actions/context, trace headers, and release symbol upload.
+Search manifests and source for the package identifiers in `official-sources.json`, `DATAFLUX_RUM`, `datafluxRum`, `FTMobileSDK`, `FTSDK`, RUM configuration builders, Session Replay calls, custom actions/context, trace headers, and release symbol upload.
 
 For each existing initializer answer:
 

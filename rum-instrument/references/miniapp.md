@@ -1,6 +1,6 @@
 # MiniApp adapter
 
-Official access guide: https://docs.guance.com/real-user-monitoring/miniapp/app-access/
+Primary-source registry: `official-sources.json#miniapp`.
 
 ## Detect and route
 

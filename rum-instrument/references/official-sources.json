@@ -1,0 +1,48 @@
+{
+  "android": {
+    "access_guide": "https://docs.guance.com/real-user-monitoring/android/app-access/",
+    "source": "https://github.com/GuanceCloud/datakit-android"
+  },
+  "apple": {
+    "access_guide": "https://docs.guance.com/real-user-monitoring/ios/app-access/",
+    "source": "https://github.com/GuanceCloud/datakit-ios"
+  },
+  "cpp": {
+    "access_guide": "https://docs.guance.com/real-user-monitoring/cpp/app-access/",
+    "source": "https://github.com/GuanceCloud/datakit-cpp"
+  },
+  "flutter": {
+    "access_guide": "https://docs.guance.com/real-user-monitoring/flutter/app-access/",
+    "source": "https://github.com/GuanceCloud/datakit-flutter"
+  },
+  "harmonyos": {
+    "access_guide": "https://docs.guance.com/real-user-monitoring/harmonyos/app-access/",
+    "package_candidates": [
+      "@guancecloud/ft_sdk",
+      "@guancecloud/ft_sdk_ext",
+      "@guancecloud/ft_native"
+    ]
+  },
+  "macos": {
+    "access_guide": "https://docs.guance.com/real-user-monitoring/macos/app-access/",
+    "source": "https://github.com/GuanceCloud/datakit-macos"
+  },
+  "miniapp": {
+    "access_guide": "https://docs.guance.com/real-user-monitoring/miniapp/app-access/"
+  },
+  "react_native": {
+    "access_guide": "https://docs.guance.com/real-user-monitoring/react-native/app-access/",
+    "source": "https://github.com/GuanceCloud/datakit-react-native"
+  },
+  "uniapp": {
+    "access_guide": "https://docs.guance.com/real-user-monitoring/uni-app/app-access/",
+    "source": "https://github.com/GuanceCloud/datakit-uniapp-native-plugin"
+  },
+  "unity": {
+    "access_guide": "https://docs.guance.com/real-user-monitoring/unity/app-access/",
+    "source": "https://github.com/GuanceCloud/datakit-unity"
+  },
+  "web": {
+    "access_guide": "https://docs.guance.com/real-user-monitoring/web/app-access/"
+  }
+}

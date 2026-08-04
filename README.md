@@ -1,6 +1,6 @@
 # AI Skills Usage Guide
 
-This repository contains reusable skills for Guance delivery work, including Dashboard generation, Monitor generation, DQL generation and review, Grafana Dashboard conversion, SLS-to-DQL conversion, OpenTelemetry instrumentation, Guance RUM instrumentation, and owl-based diagnostics.
+This repository contains reusable delivery skills, including Dashboard generation, Monitor generation, DQL generation and review, Grafana Dashboard conversion, SLS-to-DQL conversion, OpenTelemetry instrumentation, RUM instrumentation, and owl-based diagnostics.
 
 ## Directory Structure
 
@@ -37,7 +37,7 @@ ai-skills/
 | `grafana-to-guance-dashboard` | Convert and audit Grafana dashboards for Guance | Grafana dashboard JSON | Guance dashboard JSON and audit notes |
 | `otel-instrument` | Instrument C++, C#/.NET, Erlang/Elixir, Go, Java, JavaScript/TypeScript, Kotlin, PHP, Python, Ruby, Rust, and Swift repositories with OpenTelemetry | Git repository plus selected signals and trace depth | Instrumented source and existing deployment config, local validation evidence, module inventory, and unresolved runtime handoff |
 | `owl-diagnostics` | Query Guance data with `owl` and write diagnostic reports | Time range and diagnostic target | Evidence-backed Markdown report |
-| `rum-instrument` | Plan, audit, implement, repair, and validate Guance RUM for Web, MiniApp, Android, Apple platforms, HarmonyOS, React Native, Flutter, UniApp, C++, and Unity | RUM Application ID plus Public DataWay or DataKit receiver variables | Intent-aware `.rum/plan.json`, instrumented targets, validation evidence, `.rum/instrumentation.json`, and a handoff report |
+| `rum-instrument` | Plan, audit, implement, repair, and validate RUM for Web, MiniApp, Android, Apple platforms, HarmonyOS, React Native, Flutter, UniApp, C++, and Unity | RUM Application ID plus Public DataWay or DataKit receiver variables | Intent-aware `.rum/plan.json`, instrumented targets, validation evidence, and a handoff report; optional inventory |
 | `sls2dql` | Convert Alibaba Cloud SLS queries to GuanceDB DQL | SLS query plus namespace/source/index options | Conversion result and diagnostics |
 | `trivy-cluster-scan` | Run authorized, scan-only Trivy cluster and image security assessment with official remediation reporting | Authorized cluster scope, optional app paths, optional runtime confirmation | JSON scan artifacts and evidence-backed remediation report |
 | `unit` | Generate Guance unit metadata from a metrics CSV | `csv/{{name}}*.csv` | `output/unit/{{name}}.json` |
@@ -239,14 +239,14 @@ npm test
 
 Runtime requirement: Node.js 18 or newer.
 
-## Guance RUM Instrumentation
+## RUM Instrumentation
 
 `rum-instrument` detects every deployable RUM target, reviews existing instrumentation, infers platform-specific configuration, and creates a revisioned plan before changing application code. The user only needs to provide the matching RUM Application ID and receiver source variables. Authorization comes from the request verb; there is no extra `approvalMode` variable.
 
 Plan and implement a Public DataWay integration in one Prompt:
 
 ```text
-使用 $rum-instrument 规划并实施当前仓库的观测云 RUM 接入。
+使用 $rum-instrument 规划并实施当前仓库的 RUM 接入。
 
 datawayUrl: {{DATAWAY_URL}}
 appId: {{APP_ID}}
@@ -257,7 +257,7 @@ temporaryAuthCode: <paste the temporary authorization code>
 Plan and implement a DataKit integration:
 
 ```text
-使用 $rum-instrument 规划并实施当前仓库的观测云 RUM 接入。
+使用 $rum-instrument 规划并实施当前仓库的 RUM 接入。
 
 datakitUrl: {{DATAKIT_URL}}
 appId: {{APP_ID}}
@@ -275,9 +275,9 @@ appId:
   ios: {{IOS_APP_ID}}
 ```
 
-For Public DataWay, planning needs only `datawayUrl` and `appId`; it resolves production sites through `https://urls.guance.com/` and `https://urls.truewatch.com/` without consuming a temporary authorization code. The only built-in test mapping is `http://testing-openway.dataflux.cn` to `https://testing-ft2x-ai-api.dataflux.cn`; operational configuration is never loaded from `evals/`. For a one-Prompt implementation, include the one-time code directly in `temporaryAuthCode`. After the stable plan passes validation, the helper verifies the Token/state sinks and performs credential-free DataWay/AI API reachability checks before reading the code. It exchanges the code once, calls `/api/v1/rum/app/get` once per Application ID, and accepts a non-empty Client Token exactly when `token_expired` is false; sync/mapping fields are observations only and do not trigger polling. The helper writes the Client Token to a reviewed runtime/build sink and writes separate digest-bound, non-secret execution state without changing the plan revision. `temporaryAuthCode: env:GUANCE_TEMP_AUTH_CODE` remains supported for automation. `clientToken` and `aiApiEndpoint` do not belong in the standard prompt.
+For Public DataWay, planning needs only `datawayUrl` and `appId`; the helper matches the receiver to a supported official site catalog without consuming a temporary authorization code. The only built-in test mapping is `http://testing-openway.dataflux.cn` to `https://testing-ft2x-ai-api.dataflux.cn`; operational configuration is never loaded from `evals/`. For a one-Prompt implementation, include the one-time code directly in `temporaryAuthCode`. After the stable plan passes validation, the helper verifies the Token/state sinks and performs credential-free DataWay/AI API reachability checks before reading the code. It exchanges the code once, calls `/api/v1/rum/app/get` once per Application ID, and accepts a non-empty Client Token exactly when `token_expired` is false; sync/mapping fields are observations only and do not trigger polling. The helper atomically creates or updates a reviewed dotenv, JSON, properties, or xcconfig runtime/build sink, preserves unrelated entries, and writes separate digest-bound, non-secret execution state without changing the plan revision. `temporaryAuthCode: env:RUM_TEMP_AUTH_CODE` remains supported for automation. `clientToken` and `aiApiEndpoint` do not belong in the standard prompt.
 
-The Skill infers platform, entry point, `service`, `version`, environment source, sampling, and core privacy controls from the repository. It analyzes optional Logs, Trace, Replay, WebView, native reliability signals, Remote Config, Canvas Replay, and release artifacts only when already present or explicitly requested. User-defined `applicationType` wins; otherwise authorized Public DataWay implementation uses AI API metadata, with repository detection as the fallback. DataKit skips the control plane but requires evidence that the RUM collector is ready and the target runtime can reach it before implementation. An explicit implementation request continues automatically after a safe plan is validated. A plan-only request—or an implementation containing ambiguous IDs, type conflicts, dirty overlap, dependency upgrades/replacements, new optional signals/artifacts, test exceptions, unsafe Token sinks, remote mutations, or material scope drift—stops for review. Revision Review is bound to the canonical plan digest and any approved dirty-file digest; changing either invalidates approval. Approve that exact revision with:
+The Skill infers platform, entry point, `service`, `version`, environment source, sampling, and core privacy controls from the repository. It analyzes optional Logs, Trace, Replay, WebView, native reliability signals, Remote Config, Canvas Replay, and release artifacts only when already present or explicitly requested. User-defined `applicationType` wins; otherwise authorized Public DataWay implementation uses AI API metadata, with repository detection as the fallback. DataKit skips the control plane; unknown collector or runtime reachability permits local implementation but remains a warning/handoff and prevents a claim of remote ingestion. An explicit implementation request continues automatically after a safe plan is validated. A plan-only request—or an implementation containing ambiguous IDs, type conflicts, dirty overlap, dependency upgrades/replacements, new optional signals/artifacts, test exceptions, unsafe Token sinks, remote mutations, or material scope drift—stops for review. Revision Review is bound to the canonical plan digest and any approved dirty-file digest; changing either invalidates approval. Generate `.rum/instrumentation.json` only when requested or when the repository already maintains one. Approve an exact pending revision with:
 
 ```text
 Use $rum-instrument to implement .rum/plan.json revision 1.

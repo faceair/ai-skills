@@ -1,7 +1,6 @@
 # React Native adapter
 
-Official access guide: https://docs.guance.com/real-user-monitoring/react-native/app-access/
-Official source: https://github.com/GuanceCloud/datakit-react-native
+Primary-source registry: `official-sources.json#react_native`.
 
 ## Detect
 

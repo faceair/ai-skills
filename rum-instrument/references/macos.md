@@ -1,7 +1,6 @@
 # macOS adapter
 
-Official access guide: https://docs.guance.com/real-user-monitoring/macos/app-access/
-Official source: https://github.com/GuanceCloud/datakit-macos
+Primary-source registry: `official-sources.json#macos`.
 
 ## Detect
 

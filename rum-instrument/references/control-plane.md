@@ -4,12 +4,9 @@ Use this flow only for Public DataWay. DataKit sends to the user-supplied DataKi
 
 ## Authoritative endpoint resolution
 
-Load both official catalogs:
+Load both official catalogs configured in the helper.
 
-- Guance: `https://urls.guance.com/`
-- TrueWatch: `https://urls.truewatch.com/`
-
-Each catalog returns a top-level `urls` object. Match the normalized user `datawayUrl` origin to an entry's `openway` origin and take `ai_api` from the same entry. The documented Web RUM address `https://rum-openway.guance.com` is the RUM-specific alias for the Guance `default` entry.
+Each catalog returns a top-level `urls` object. Match the normalized user `datawayUrl` origin to an entry's `openway` origin and take `ai_api` from the same entry. Accept only the documented default Web RUM alias encoded in the helper.
 
 Do not:
 
@@ -95,16 +92,16 @@ Keep Public DataWay `control_plane.status: catalog_resolved` stable. After plan 
 
 Planning runs the helper in `--site-only` mode. It resolves the official catalog and non-secret AI API endpoint without reading a temporary authorization code, exchanging credentials, looking up an application, or receiving a Client Token.
 
-Approved implementation performs local destination checks and credential-free reachability checks before reading the authorization code. It then performs the credential/application lookup and must write the Client Token to a dedicated environment-assignment file plus a separate non-secret control-plane state file. The helper refuses an application lookup without both destinations and the canonical plan digest, so a one-time code cannot be consumed while discarding the Token or producing state for another plan. The secret sink is a transport into an existing reviewed build/runtime injection path; do not assume every platform natively reads process environment variables. It is allowed only when:
+Approved implementation performs local destination checks and credential-free reachability checks before reading the authorization code. It then performs the credential/application lookup and must write the Client Token to a reviewed runtime/build configuration file plus a separate non-secret control-plane state file. The helper refuses an application lookup without both destinations and the canonical plan digest, so a one-time code cannot be consumed while discarding the Token or producing state for another plan. Select dotenv, JSON, properties, or xcconfig according to the target's existing configuration path. It is allowed only when:
 
 - Git confirms an in-repository path is ignored; an external path additionally requires the explicit `--allow-external-secret-sink` Review decision;
 - the helper receives and verifies the Git worktree root, preventing a subdirectory or unrelated path from bypassing the ignore check;
-- the file does not already exist;
-- the file is created with mode `0600`;
-- the state destination is distinct from the secret sink, Git-ignored when it is inside the repository, and neither destination exists;
+- the file is a regular non-symlink; create it or atomically update only the selected keys while preserving unrelated entries;
+- the resulting file has mode `0600`;
+- the state destination is distinct from the secret sink, Git-ignored when it is inside the repository, and does not already exist;
 - maintained source references only the selected runtime variable;
 - the Agent does not open, print, diff, stage, or otherwise inspect the file.
 
-The helper builds the safe result before writing, writes the secret sink first, then the state file, and removes the newly created secret sink if state persistence fails. Its stdout and state file contain only a `runtime:<VARIABLE>` reference, the plan digest, credential-free preflight evidence, and non-secret site/application observations.
+The helper builds the safe result before writing, writes the secret sink first, then the state file, and restores the previous sink if state persistence fails. Its stdout and state file contain only a `runtime:<KEY>` reference, sink metadata, the plan digest, credential-free preflight evidence, and non-secret site/application observations.
 
-On a rerun, an existing reviewed secret sink plus matching non-secret state is convergence evidence. Preserve both and skip credential resolution; read only the state. If the helper is invoked with an existing sink, colliding state path, missing repository guard, unsafe Git-ignore state, or unreviewed external sink, it fails before site resolution, network preflight, temporary-code input, or credential exchange.
+On a rerun, an existing reviewed secret sink plus matching non-secret state is convergence evidence. Preserve both and skip credential resolution; read only the state. A colliding state path, missing repository guard, unsafe Git-ignore state, symlinked sink, or unreviewed external sink fails before site resolution, network preflight, temporary-code input, or credential exchange.

@@ -20,12 +20,12 @@ Application IDs and receiver URLs are configuration. A temporary authorization c
 - accept a temporary authorization code directly from the Prompt or a later user message, but never repeat it;
 - pass a prompt-provided code to the bundled helper through process stdin; disable terminal echo when a TTY is available, and keep a named environment variable as the optional automation path;
 - keep the exchanged API Key only in helper-process memory;
-- route the Client Token directly to a reviewed environment-assignment/build configuration sink;
+- route the Client Token directly to a reviewed runtime/build configuration sink;
 - preserve only the redacted `prompt:provided` marker, `env:`, `runtime:`, or existing configuration references in plans and reports;
 - do not echo, print, diff, stage, screenshot, or otherwise inspect credential values or the generated secret file;
 - never place a real authorization code, API Key, or Client Token in command arguments, tracked source, fixtures, logs, or execution state.
 
-The helper refuses to overwrite a restricted configuration file, requires separate digest-bound recoverable state, rolls back a newly written Client Token sink if state persistence fails, and refuses in-repository Token/state files that Git does not ignore. Its dotenv-shaped output does not justify adding a dotenv loader to native code. If the repository has no safe existing runtime/build-time injection source, keep implementation blocked and leave value injection to the human deployment system.
+The helper creates or atomically updates a reviewed dotenv, JSON, properties, or xcconfig sink, preserves unrelated entries, requires separate digest-bound recoverable state, restores the previous sink if state persistence fails, and refuses in-repository Token/state files that Git does not ignore. Select a format already consumed by the target; never add a dotenv loader to native code merely for this workflow. If the repository has no safe runtime/build-time injection source, keep implementation blocked and leave value injection to the human deployment system.
 
 An insecure TLS context is permitted only for an explicitly approved test-site catalog. Keep that context scoped to AI API requests in the helper, preserve verified TLS for official catalogs, and never persist certificate errors or credential-bearing response content.
 

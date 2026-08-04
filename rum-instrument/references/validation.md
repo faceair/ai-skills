@@ -14,13 +14,13 @@ For Revision Review, recompute the canonical plan digest and verify it equals `a
 
 For Public DataWay, also validate:
 
-- normalized origin matches `openway` in an official Guance/TrueWatch catalog or the documented default Web RUM alias;
+- normalized origin matches `openway` in a supported official catalog or the documented default Web RUM alias;
 - `ai_api` comes from the matched catalog entry rather than hostname rewriting;
 - the exchange and application lookup paths are exact;
 - stdout, execution state, plans, diffs, and Git status contain no temporary code, API Key, or Client Token value;
-- an in-repository restricted environment-assignment file is ignored and mode `0600`.
+- an in-repository restricted runtime/build configuration file is ignored and mode `0600`;
 - the helper verifies both receiver origins without credentials before reading the temporary code;
-- the application lookup used both a new restricted configuration sink and a distinct Git-ignored state file; a simulated state-write failure leaves no orphan Client Token sink;
+- the application lookup used a supported create-or-update configuration sink and a distinct Git-ignored state file; a simulated state-write failure restores the previous sink;
 - one code exchange and one successful lookup occur per Application ID; only transient lookup transport failures are retried;
 - Token acceptance checks only `token_expired: false` plus a present non-empty `client_token`; sync/mapping observations do not trigger polling or block implementation;
 - before application-code edits, the stable plan and matching digest-bound execution state pass implementation validation.
@@ -34,7 +34,7 @@ For the approved built-in testing site, additionally validate:
 - `--insecure-test-tls` was explicitly approved and cannot run for an official site;
 - the built-in testing site, TLS exception, and HTTP DataWay receiver are excluded from production configuration.
 
-For DataKit, assert that no control-plane lookup, temporary code, API Key, or Client Token is present. Require evidence that the RUM collector is enabled/configured and that the target runtime can reach the exact DataKit origin; unknown or blocked readiness prevents implementation.
+For DataKit, assert that no control-plane lookup, temporary code, API Key, or Client Token is present. Record collector and runtime reachability evidence when available. Unknown readiness permits local implementation but prevents a claim of remotely verified ingestion.
 
 ## Local implementation proof
 
@@ -77,9 +77,9 @@ When applicable, generate without uploading and verify:
 - Flutter/React Native/Unity wrapper and native artifacts share the intended release identity;
 - upload commands use placeholders or existing secret references and have not been executed without authorization.
 
-## Inventory validation
+## Optional inventory validation
 
-Validate `.rum/instrumentation.json` using:
+When the user requests an inventory or the repository already maintains one, validate `.rum/instrumentation.json` using:
 
 ```bash
 python3 <skill-dir>/scripts/validate_contract.py .rum/instrumentation.json --kind instrumentation

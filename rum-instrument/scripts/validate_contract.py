@@ -11,6 +11,7 @@ import hashlib
 import json
 from pathlib import Path, PurePosixPath
 import re
+import stat
 import subprocess
 import sys
 from typing import Any
@@ -83,6 +84,8 @@ TESTING_AI_API_ENDPOINT = "https://testing-ft2x-ai-api.dataflux.cn"
 TLS_VERIFICATION_MODES = {"verified", "disabled_for_testing"}
 CONTROL_PLANE_STATUSES = {"catalog_resolved", "resolved", "blocked"}
 CLIENT_TOKEN_AVAILABILITY = {"planned", "existing", "persisted"}
+CLIENT_TOKEN_SINK_FORMATS = {"dotenv", "json", "properties", "xcconfig"}
+CLIENT_TOKEN_SINK_SCOPES = {"repository", "external"}
 APPLICATION_TYPES = {
     "web",
     "miniapp",
@@ -564,6 +567,68 @@ def validate_datakit_readiness(
     if status == "unknown" and "blocked" in check_statuses:
         errors.append(f"{location}.status must be blocked when a readiness check is blocked")
     return status if status in READINESS_STATUSES else None
+
+
+def _client_token_reference_key(reference: Any) -> str | None:
+    source = reference.get("source") if isinstance(reference, dict) else None
+    if not isinstance(source, str):
+        return None
+    if source.startswith(("runtime:", "env:")):
+        return source.split(":", 1)[1]
+    if source.startswith("existing:") and "#" in source:
+        return source.rsplit("#", 1)[1]
+    return None
+
+
+def validate_client_token_sink(
+    value: Any,
+    location: str,
+    reference: Any,
+    errors: list[str],
+) -> tuple[str, str, str] | None:
+    if not isinstance(value, dict):
+        errors.append(f"{location} must be an object")
+        return None
+    if set(value) != {"path", "format", "scope", "key"}:
+        errors.append(
+            f"{location} must contain only path, format, scope, and key"
+        )
+        return None
+    path = value.get("path")
+    sink_format = value.get("format")
+    scope = value.get("scope")
+    key = value.get("key")
+    if not is_nonempty_string(path) or "\n" in path or "\r" in path:
+        errors.append(f"{location}.path must be a non-empty single-line string")
+    else:
+        path_value = Path(path)
+        if ".." in path_value.parts or ".git" in path_value.parts:
+            errors.append(f"{location}.path must not traverse parents or .git")
+        if scope == "repository" and path_value.is_absolute():
+            errors.append(f"{location}.path must be repository-relative")
+        if scope == "external" and not path_value.is_absolute():
+            errors.append(f"{location}.path must be absolute for an external sink")
+    if sink_format not in CLIENT_TOKEN_SINK_FORMATS:
+        errors.append(
+            f"{location}.format must be dotenv, json, properties, or xcconfig"
+        )
+    if scope not in CLIENT_TOKEN_SINK_SCOPES:
+        errors.append(f"{location}.scope must be repository or external")
+    if not is_nonempty_string(key):
+        errors.append(f"{location}.key must be a non-empty string")
+    expected_key = _client_token_reference_key(reference)
+    if is_nonempty_string(key) and key != expected_key:
+        errors.append(
+            f"{location}.key does not match the Client Token source reference"
+        )
+    if (
+        not is_nonempty_string(path)
+        or sink_format not in CLIENT_TOKEN_SINK_FORMATS
+        or scope not in CLIENT_TOKEN_SINK_SCOPES
+        or not is_nonempty_string(key)
+    ):
+        return None
+    return path, sink_format, scope
 
 
 def validate_https_origin(value: Any, location: str, errors: list[str]) -> None:
@@ -1090,6 +1155,8 @@ def validate_plan(plan: Any, phase: str) -> tuple[list[str], list[str]]:
     receiver_mode: str | None = None
     datakit_readiness_status: str | None = None
     receiver_client_tokens: dict[str, Any] = {}
+    receiver_client_token_sinks: set[tuple[str, str, str]] = set()
+    external_client_token_sink = False
     control_plane_status: str | None = None
     control_plane_catalog: str | None = None
     control_plane_tls_verification: str | None = None
@@ -1173,6 +1240,23 @@ def validate_plan(plan: Any, phase: str) -> tuple[list[str], list[str]]:
                     errors.append(
                         f"{location}.availability must be planned, existing, or persisted"
                     )
+                sink = (
+                    client_token.get("sink")
+                    if isinstance(client_token, dict)
+                    else None
+                )
+                sink_identity = validate_client_token_sink(
+                    sink,
+                    f"{location}.sink",
+                    client_token,
+                    errors,
+                )
+                if sink_identity is not None:
+                    receiver_client_token_sinks.add(sink_identity)
+                    external_client_token_sink = (
+                        external_client_token_sink
+                        or sink_identity[2] == "external"
+                    )
             if "client_token" in receiver:
                 errors.append(
                     "request.receiver.client_token is obsolete; use slot-keyed client_tokens"
@@ -1194,14 +1278,25 @@ def validate_plan(plan: Any, phase: str) -> tuple[list[str], list[str]]:
             )
         if mode == "datakit" and "control_plane" in receiver:
             errors.append("request.receiver.control_plane is valid only for public_dataway")
-        if mode == "datakit":
+        if mode == "datakit" and "readiness" in receiver:
             datakit_readiness_status = validate_datakit_readiness(
                 receiver.get("readiness"),
                 "request.receiver.readiness",
                 errors,
             )
+        elif mode == "datakit":
+            datakit_readiness_status = "unknown"
+            warnings.append(
+                "DataKit readiness is not recorded; local implementation may proceed, "
+                "but remote ingestion remains unverified"
+            )
         elif "readiness" in receiver:
             errors.append("request.receiver.readiness is valid only for datakit")
+        if len(receiver_client_token_sinks) > 1:
+            errors.append(
+                "request.receiver.client_tokens must use one shared sink path, "
+                "format, and scope"
+            )
 
         forbidden_input_fields = {
             "datawayUrl",
@@ -1230,6 +1325,8 @@ def validate_plan(plan: Any, phase: str) -> tuple[list[str], list[str]]:
     application_slot_owners: dict[str, str] = {}
     active_receiver_slots: set[str] = set()
     material_review_reasons: list[str] = []
+    if external_client_token_sink:
+        material_review_reasons.append("external Client Token sink")
     for index, target in enumerate(targets):
         location = f"targets[{index}]"
         if not isinstance(target, dict):
@@ -1512,10 +1609,6 @@ def validate_plan(plan: Any, phase: str) -> tuple[list[str], list[str]]:
             )
         if control_plane_status == "blocked":
             implementation_blockers.append("the control plane is blocked")
-        if datakit_readiness_status in {"unknown", "blocked"}:
-            implementation_blockers.append(
-                f"DataKit readiness is {datakit_readiness_status}"
-            )
         if "blocked" in dependency_actions:
             implementation_blockers.append("a dependency decision is blocked")
         if approval_blockers:
@@ -1558,11 +1651,15 @@ def validate_plan(plan: Any, phase: str) -> tuple[list[str], list[str]]:
             errors.append(
                 "implementation requires a resolved Public DataWay site"
             )
-        if phase == "implement" and receiver_mode == "datakit":
-            if datakit_readiness_status != "verified":
-                errors.append(
-                    "implementation requires verified DataKit receiver readiness"
-                )
+        if (
+            phase == "implement"
+            and receiver_mode == "datakit"
+            and datakit_readiness_status != "verified"
+        ):
+            warnings.append(
+                "DataKit receiver readiness is not verified; complete local "
+                "instrumentation and retain collector/reachability checks as handoff"
+            )
         if phase == "implement" and implementation_blockers:
             errors.append(
                 "implementation cannot start while blockers remain: "
@@ -1576,6 +1673,9 @@ def validate_plan(plan: Any, phase: str) -> tuple[list[str], list[str]]:
 def validate_control_plane_state(
     state: Any,
     plan: dict[str, Any],
+    *,
+    repository: Path | None = None,
+    state_path: Path | None = None,
 ) -> tuple[list[str], list[str]]:
     errors: list[str] = []
     warnings: list[str] = []
@@ -1662,9 +1762,28 @@ def validate_control_plane_state(
             )
 
     plan_types: dict[str, dict[str, Any]] = {}
+    plan_app_ids: dict[str, str] = {}
     for target in plan.get("targets", []):
         if not isinstance(target, dict) or target.get("disposition") != "planned":
             continue
+        application_ids = target.get("application_ids")
+        if isinstance(application_ids, dict):
+            for slot, descriptor in application_ids.items():
+                identity = reference_identity(descriptor)
+                if slot not in expected_slots or identity is None:
+                    continue
+                kind, value = identity
+                if kind != "value":
+                    errors.append(
+                        f"Public DataWay implementation requires a concrete Application ID "
+                        f"value in the plan for slot {slot}"
+                    )
+                elif slot in plan_app_ids and plan_app_ids[slot] != value:
+                    errors.append(
+                        f"plan contains conflicting Application IDs for slot {slot}"
+                    )
+                else:
+                    plan_app_ids[slot] = value
         application_types = target.get("application_types")
         if not isinstance(application_types, dict):
             continue
@@ -1701,6 +1820,11 @@ def validate_control_plane_state(
             errors.append(
                 f"control-plane state applications.{slot}.client_token_available must be true"
             )
+        expected_app_id = plan_app_ids.get(slot)
+        if expected_app_id is not None and application.get("app_id") != expected_app_id:
+            errors.append(
+                f"control-plane state applications.{slot}.app_id does not match the plan"
+            )
         api_type = application.get("api_app_type")
         if api_type not in APPLICATION_TYPES:
             errors.append(
@@ -1714,6 +1838,26 @@ def validate_control_plane_state(
             )
             continue
         planned_type = descriptor.get("value")
+        expected_selected_source = (
+            "user" if descriptor.get("source") == "user" else "ai_api"
+        )
+        if application.get("selected_app_type") != planned_type:
+            errors.append(
+                f"control-plane state applications.{slot}.selected_app_type "
+                "does not match the plan"
+            )
+        if application.get("selected_app_type_source") != expected_selected_source:
+            errors.append(
+                f"control-plane state applications.{slot}.selected_app_type_source "
+                "does not match the plan"
+            )
+        expected_mismatch = bool(
+            descriptor.get("source") == "user" and api_type != planned_type
+        )
+        if application.get("type_mismatch") is not expected_mismatch:
+            errors.append(
+                f"control-plane state applications.{slot}.type_mismatch is inconsistent"
+            )
         if api_type == planned_type:
             continue
         accepted_mismatch = (
@@ -1727,6 +1871,186 @@ def validate_control_plane_state(
                 f"control-plane state applications.{slot}.api_app_type differs from "
                 "the planned application type; revise and review the plan"
             )
+
+    secret_sink = state.get("secret_sink")
+    planned_sinks = [
+        reference.get("sink")
+        for reference in expected_tokens.values()
+        if isinstance(reference, dict) and isinstance(reference.get("sink"), dict)
+    ]
+    planned_sink = planned_sinks[0] if planned_sinks else None
+    if not isinstance(secret_sink, dict):
+        errors.append("control-plane state secret_sink must be an object")
+    else:
+        sink_format = secret_sink.get("format")
+        if sink_format not in {"dotenv", "json", "properties", "xcconfig"}:
+            errors.append(
+                "control-plane state secret_sink.format must be dotenv, json, "
+                "properties, or xcconfig"
+            )
+        elif not isinstance(planned_sink, dict) or sink_format != planned_sink.get(
+            "format"
+        ):
+            errors.append(
+                "control-plane state secret_sink.format does not match the plan"
+            )
+        sink_scope = secret_sink.get("scope")
+        if sink_scope not in {"repository", "external"}:
+            errors.append(
+                "control-plane state secret_sink.scope must be repository or external"
+            )
+        elif not isinstance(planned_sink, dict) or sink_scope != planned_sink.get(
+            "scope"
+        ):
+            errors.append(
+                "control-plane state secret_sink.scope does not match the plan"
+            )
+        sink_keys = secret_sink.get("keys")
+        if not isinstance(sink_keys, dict) or set(sink_keys) != expected_slots:
+            errors.append(
+                "control-plane state secret_sink.keys must match the plan's Client Token slots"
+            )
+            sink_keys = {}
+        for slot in sorted(expected_slots & set(sink_keys)):
+            key = sink_keys.get(slot)
+            expected_reference = expected_tokens.get(slot)
+            expected_key = _client_token_reference_key(expected_reference)
+            planned_slot_sink = (
+                expected_reference.get("sink")
+                if isinstance(expected_reference, dict)
+                else None
+            )
+            if key != expected_key:
+                errors.append(
+                    f"control-plane state secret_sink.keys.{slot} does not match "
+                    "the plan's Client Token reference"
+                )
+            if (
+                isinstance(planned_slot_sink, dict)
+                and key != planned_slot_sink.get("key")
+            ):
+                errors.append(
+                    f"control-plane state secret_sink.keys.{slot} does not match "
+                    "the planned sink key"
+                )
+
+        sink_path_value = secret_sink.get("path")
+        if not is_nonempty_string(sink_path_value):
+            errors.append("control-plane state secret_sink.path must be a non-empty string")
+        elif (
+            isinstance(planned_sink, dict)
+            and planned_sink.get("scope") == "external"
+            and sink_path_value != planned_sink.get("path")
+        ):
+            errors.append(
+                "control-plane state secret_sink.path does not match the plan"
+            )
+        elif repository is not None:
+            repository_root = repository.resolve()
+            sink_path = Path(sink_path_value)
+            if not sink_path.is_absolute():
+                errors.append("control-plane state secret_sink.path must be absolute")
+            elif sink_path.is_symlink() or not sink_path.is_file():
+                errors.append(
+                    "control-plane state secret_sink.path must be an existing regular non-symlink file"
+                )
+            else:
+                resolved_sink = sink_path.resolve()
+                inside_repository = (
+                    resolved_sink == repository_root
+                    or repository_root in resolved_sink.parents
+                )
+                actual_scope = "repository" if inside_repository else "external"
+                if sink_scope != actual_scope:
+                    errors.append(
+                        "control-plane state secret_sink.scope does not match its path"
+                    )
+                planned_path = (
+                    planned_sink.get("path")
+                    if isinstance(planned_sink, dict)
+                    else None
+                )
+                expected_sink_path = (
+                    (repository_root / planned_path).resolve()
+                    if sink_scope == "repository"
+                    and isinstance(planned_path, str)
+                    else Path(planned_path).resolve()
+                    if isinstance(planned_path, str)
+                    else None
+                )
+                if expected_sink_path is None or resolved_sink != expected_sink_path:
+                    errors.append(
+                        "control-plane state secret_sink.path does not match the plan"
+                    )
+                if stat.S_IMODE(resolved_sink.stat().st_mode) != 0o600:
+                    errors.append(
+                        "control-plane state secret_sink.path must have mode 0600"
+                    )
+                if inside_repository:
+                    relative = resolved_sink.relative_to(repository_root)
+                    try:
+                        ignored = subprocess.run(
+                            [
+                                "git",
+                                "-C",
+                                str(repository_root),
+                                "check-ignore",
+                                "-q",
+                                "--",
+                                str(relative),
+                            ],
+                            check=False,
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                        ).returncode == 0
+                    except OSError:
+                        ignored = False
+                    if not ignored:
+                        errors.append(
+                            "control-plane state secret_sink.path must be Git-ignored"
+                        )
+                elif not revision_reviewed:
+                    errors.append(
+                        "an external Client Token sink requires revision_review"
+                    )
+                if state_path is not None:
+                    resolved_state = state_path.resolve()
+                    if resolved_sink == resolved_state:
+                        errors.append(
+                            "control-plane state file and Client Token sink must differ"
+                        )
+
+    if repository is not None and state_path is not None:
+        repository_root = repository.resolve()
+        if state_path.is_symlink() or not state_path.is_file():
+            errors.append(
+                "control-plane execution state must be an existing regular non-symlink file"
+            )
+        else:
+            resolved_state = state_path.resolve()
+            if repository_root in resolved_state.parents:
+                relative = resolved_state.relative_to(repository_root)
+                try:
+                    ignored = subprocess.run(
+                        [
+                            "git",
+                            "-C",
+                            str(repository_root),
+                            "check-ignore",
+                            "-q",
+                            "--",
+                            str(relative),
+                        ],
+                        check=False,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                    ).returncode == 0
+                except OSError:
+                    ignored = False
+                if not ignored:
+                    errors.append(
+                        "control-plane execution state inside the repository must be Git-ignored"
+                    )
 
     validate_sensitive_values(state, "control_plane_state", errors)
     return errors, warnings
@@ -1795,14 +2119,21 @@ def validate_inventory(inventory: Any) -> tuple[list[str], list[str]]:
                         )
         elif raw_tokens is not None:
             errors.append("receiver.client_tokens is valid only for public_dataway")
-        if mode == "datakit":
+        if mode == "datakit" and "readiness" in receiver:
             datakit_readiness_status = validate_datakit_readiness(
                 receiver.get("readiness"),
                 "receiver.readiness",
                 errors,
             )
             if datakit_readiness_status != "verified":
-                errors.append("receiver.readiness must be verified in a final inventory")
+                warnings.append(
+                    "receiver.readiness is not verified; remote ingestion must remain unverified"
+                )
+        elif mode == "datakit":
+            datakit_readiness_status = "unknown"
+            warnings.append(
+                "receiver.readiness is not recorded; remote ingestion must remain unverified"
+            )
         elif "readiness" in receiver:
             errors.append("receiver.readiness is valid only for datakit")
 
@@ -1964,6 +2295,15 @@ def validate_inventory(inventory: Any) -> tuple[list[str], list[str]]:
             errors.append(
                 "remote_verification.evidence must not be empty when verified=true"
             )
+        if (
+            mode == "datakit"
+            and datakit_readiness_status != "verified"
+            and remote.get("verified") is True
+        ):
+            errors.append(
+                "remote_verification.verified cannot be true while DataKit readiness "
+                "is not verified"
+            )
 
     validate_sensitive_values(inventory, "", errors)
     return errors, warnings
@@ -2107,10 +2447,11 @@ def validate_repository_state(plan: Any, repository: Path) -> list[str]:
     unreviewed_dirty: list[str] = []
     changed_reviewed: list[str] = []
     for planned_file in dirty_planned_files:
+        if planned_file not in initial_paths:
+            continue
         expected_digest = reviewed_overlaps.get(planned_file)
         if (
             approval.get("basis") != "revision_review"
-            or planned_file not in initial_paths
             or expected_digest is None
         ):
             unreviewed_dirty.append(planned_file)
@@ -2140,7 +2481,9 @@ def validate_repository_state(plan: Any, repository: Path) -> list[str]:
         for evidence in target.get("evidence", [])
         if is_nonempty_string(evidence)
     }
-    changed_evidence = sorted((dirty_paths - initial_paths) & evidence_paths)
+    changed_evidence = sorted(
+        ((dirty_paths - initial_paths) - planned_files) & evidence_paths
+    )
     if changed_evidence:
         errors.append(
             "repository evidence changed after planning: " + ", ".join(changed_evidence)
@@ -2236,6 +2579,8 @@ def main() -> int:
                     state_errors, state_warnings = validate_control_plane_state(
                         execution_state,
                         document,
+                        repository=arguments.repository,
+                        state_path=arguments.execution_state,
                     )
                     errors.extend(state_errors)
                     warnings.extend(state_warnings)

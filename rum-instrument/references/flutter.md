@@ -1,7 +1,6 @@
 # Flutter adapter
 
-Official access guide: https://docs.guance.com/real-user-monitoring/flutter/app-access/
-Official source: https://github.com/GuanceCloud/datakit-flutter
+Primary-source registry: `official-sources.json#flutter`.
 
 ## Detect and split variants
 

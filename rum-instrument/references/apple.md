@@ -1,7 +1,6 @@
 # iOS/tvOS adapter
 
-Official current access guide: https://docs.guance.com/real-user-monitoring/ios/app-access/
-Official source: https://github.com/GuanceCloud/datakit-ios
+Primary-source registry: `official-sources.json#apple`.
 
 ## Detect
 

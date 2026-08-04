@@ -1,7 +1,6 @@
 # Android adapter
 
-Official access guide: https://docs.guance.com/real-user-monitoring/android/app-access/
-Official source: https://github.com/GuanceCloud/datakit-android
+Primary-source registry: `official-sources.json#android`.
 
 ## Detect
 
