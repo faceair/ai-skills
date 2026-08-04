@@ -1,18 +1,17 @@
-# Apple adapter
+# iOS/tvOS adapter
 
 Official current access guide: https://docs.guance.com/real-user-monitoring/ios/app-access/
-Legacy macOS route to verify when applicable: https://docs.guance.com/real-user-monitoring/macos/app-access/
 Official source: https://github.com/GuanceCloud/datakit-ios
 
 ## Detect
 
-Confirm independently shipped iOS, tvOS, or macOS targets from Xcode project/workspace settings, `Package.swift`, Info.plist/build settings, schemes, application/scene lifecycle, and archive configuration. Do not treat Pods, DerivedData, generated projects, or wrapper-owned iOS subprojects as independent applications.
+Confirm independently shipped iOS or tvOS targets from Xcode project/workspace settings, `Package.swift`, Info.plist/build settings, schemes, application/scene lifecycle, and archive configuration. Do not treat Pods, DerivedData, generated projects, or wrapper-owned iOS subprojects as independent applications.
 
 Inspect existing `FTMobileSDK`, SPM/Carthage/CocoaPods wiring, App/Scene delegate initialization, URLSession instrumentation, WebView bridge, Widget Extension setup, Replay, and dSYM tasks.
 
 ## Plan
 
-Route iOS, tvOS, and macOS through the capability set documented for the selected SDK version; the documentation navigation may consolidate Apple platforms while older macOS pages remain accessible. Record which current page/release proves support for the actual target.
+Route iOS and tvOS through the capability set documented for the selected `datakit-ios`/`FTMobileSDK` version. Do not use this adapter for macOS; macOS uses `datakit-macos`/`FTMacOSSDK` and its own startup rules.
 
 Verify SPM, CocoaPods, or Carthage compatibility and preserve the repository's package manager. Map receiver and Application ID with the current SDK configuration API. Initialize once at the earliest supported application lifecycle point, with extension processes handled separately when documented.
 

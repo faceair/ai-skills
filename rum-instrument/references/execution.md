@@ -1,4 +1,4 @@
-# Repository execution and approval
+# Repository execution and authorization
 
 ## Safety baseline
 
@@ -10,7 +10,7 @@ Read repository-level and nested agent instructions before analysis. Record:
 - documented format, build/type-check, test, and smoke commands;
 - current RUM, Logs, Trace, Replay, Sourcemap, dSYM, mapping, and native-symbol behavior.
 
-Never stash, reset, clean, overwrite, or reformat unrelated user work. An unrelated dirty worktree may be analyzed. Stop before an edit whose file or hunk overlaps existing work.
+Never stash, reset, clean, overwrite, or reformat unrelated user work. An unrelated dirty worktree may be analyzed. A planned dirty file blocks ordinary explicit implementation. Revision Review may approve an exact pre-existing overlap only when `reviewed_overlaps` binds the file bytes reviewed by the user; any new dirty file or digest drift blocks implementation.
 
 ## Target ownership
 
@@ -29,14 +29,20 @@ Trace every target to its canonical maintained startup source. Do not edit `dist
 
 “规划” and “审查” do not authorize application-code edits. A planning run may create or update `.rum/plan.json` when the repository is writable, because that file is the requested planning artifact. If the user requested a purely read-only review, return the same contract in the response without writing it.
 
-The plan must cover the entire in-scope repository before the first implementation edit. Record exact files and batches so approval is meaningful.
+The plan must cover the entire in-scope repository before the first implementation edit. Record exact files and batches so authorization is auditable.
 
-## Approval gate
+## Intent-aware authorization
 
-Approval is valid only when the user identifies the plan revision or clearly approves the latest displayed revision. Before implementation, confirm:
+Infer authorization from the user's verb; do not add an `approvalMode` Prompt variable:
+
+- “规划”, “审查”, “plan”, “audit”, and read-only “validate” are plan-only. Write a pending plan with `basis: plan_only_request` and stop.
+- “实施”, “接入”, “修复”, “implement”, “integrate”, “repair”, and “规划并实施” explicitly authorize ordinary repository changes required for core RUM. Generate and validate the plan first, then use `status: approved` with `basis: explicit_implementation_request` and continue in the same run.
+- A later message that identifies or clearly approves the latest persisted revision uses `basis: revision_review`.
+
+Before implementation, confirm:
 
 - repository identity and commit;
-- analysis fingerprint;
+- initial Git status and every planned file;
 - target set and Application ID slots;
 - receiver mode and source references;
 - SDK/package decisions;
@@ -44,9 +50,23 @@ Approval is valid only when the user identifies the plan revision or clearly app
 - exact files and validation commands;
 - dirty-file overlap.
 
-For Public DataWay also confirm the official catalog match, non-secret AI API metadata, temporary-code source reference, runtime Client Token variable, and ignored secret sink. Never inspect the sink's contents.
+For Public DataWay also confirm the official catalog match, non-secret AI API metadata, temporary-code source reference when already supplied, runtime Client Token variable, and ignored secret sink. Never inspect the sink's contents.
 
-Revise and reapprove when any of these changes materially. A request such as “开始实现” approves the design being discussed only when a matching persisted plan exists and the response clearly identifies its revision; otherwise first create the plan and stop.
+Explicit implementation intent is not blanket approval. Stop with `status: pending`, `basis: explicit_implementation_request`, and concrete `approval.blockers` when the plan contains any of:
+
+- ambiguous or reused Application ID slots;
+- a user-defined application type that conflicts with AI API metadata;
+- an uncommitted file or hunk overlapping a planned edit;
+- SDK dependency upgrade, replacement, removal, or unverifiable provenance;
+- new Logs, Trace, Replay, WebView, native crash, ANR, freeze, UI-block, Remote Config, Canvas Replay, Sourcemap, symbol, or other optional scope;
+- a non-production catalog, disabled TLS verification, or another test-only exception;
+- no safe ignored runtime Client Token sink;
+- a remote mutation such as application creation, deployment, or artifact upload;
+- a material change to targets, files, receiver mode, signals, privacy behavior, or artifact handling after plan validation.
+
+Continue only after the user reviews the exact revised plan. Record that as `basis: revision_review`, add the canonical digest printed by `validate_contract.py --print-review-digest`, and record an exact digest for every approved dirty overlap. A plain “开始实现” may approve the latest displayed or persisted pending revision only when repository identity, revision, digest, and overlap set are unambiguous.
+
+Record optional capability and artifact decisions in the structured `existing_instrumentation.signals`, `profile.signals`, and `artifacts` fields defined by [contracts.md](contracts.md). The plan validator derives Review requirements from those fields; free-form risk prose is not an authorization control.
 
 ## Baseline and batches
 
@@ -64,7 +84,7 @@ Batch by independently deployable target while respecting shared initialization/
 
 Rerunning the Skill must converge on one initializer and one canonical configuration path.
 
-The temporary authorization code is one-time. A planning lookup may consume it while discarding the Client Token; implementation therefore requires a fresh code unless an approved runtime Client Token source already exists.
+Planning never consumes the temporary authorization code. Authorized Public DataWay implementation resolves the application, persists its non-secret metadata, updates/revalidates the plan, and routes its Client Token once before application-code edits; a rerun preserves an existing safe runtime sink instead of exchanging another code. DataKit implementation requires evidence that the RUM collector is enabled and the application runtime can reach its receiver.
 
 ## Remote actions
 

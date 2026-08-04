@@ -43,6 +43,7 @@ EXCLUDED_DIRS = {
     "build",
     "coverage",
     "dist",
+    "evals",
     "examples",
     "fixtures",
     "node_modules",
@@ -192,25 +193,93 @@ class Candidate:
             self.confidence = confidence
 
 
-def walk_files(root: Path) -> list[Path]:
+def is_excluded_path(path: Path, root: Path) -> bool:
+    relative_path = path.relative_to(root)
+    relative_text = relative_path.as_posix()
+    if any(part in EXCLUDED_DIRS for part in relative_path.parts):
+        return True
+    excluded_prefixes = {
+        value for value in EXCLUDED_DIRS | EXCLUDED_RELATIVE_DIRS if "/" in value
+    }
+    return any(
+        relative_text == prefix or relative_text.startswith(f"{prefix}/")
+        for prefix in excluded_prefixes
+    )
+
+
+def walk_files(root: Path, scan_root: Path | None = None) -> list[Path]:
+    scan_root = (scan_root or root).resolve()
     files: list[Path] = []
-    for current, dirnames, filenames in os.walk(root, followlinks=False):
+    for current, dirnames, filenames in os.walk(scan_root, followlinks=False):
         current_path = Path(current)
         kept: list[str] = []
         for dirname in dirnames:
-            relative = (current_path / dirname).relative_to(root).as_posix()
-            if (
-                dirname in EXCLUDED_DIRS
-                or relative in EXCLUDED_DIRS
-                or relative in EXCLUDED_RELATIVE_DIRS
-            ):
+            candidate = current_path / dirname
+            if is_excluded_path(candidate, root):
                 continue
-            if (current_path / dirname).is_symlink():
+            if candidate.is_symlink():
                 continue
             kept.append(dirname)
         dirnames[:] = kept
-        files.extend(current_path / name for name in filenames)
-    return files
+        files.extend(
+            current_path / name
+            for name in filenames
+            if not is_excluded_path(current_path / name, root)
+        )
+    return sorted(files)
+
+
+def git_files(root: Path, scan_root: Path) -> list[Path] | None:
+    top_level = git_value(root, "rev-parse", "--show-toplevel")
+    if top_level is None or Path(top_level).resolve() != root:
+        return None
+    pathspec = relative(scan_root, root)
+    try:
+        process = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(root),
+                "ls-files",
+                "-z",
+                "--cached",
+                "--others",
+                "--exclude-standard",
+                "--",
+                pathspec,
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+    except OSError:
+        return None
+    if process.returncode != 0:
+        return None
+
+    files: list[Path] = []
+    for raw_path in process.stdout.split(b"\0"):
+        if not raw_path:
+            continue
+        try:
+            repository_path = raw_path.decode("utf-8")
+        except UnicodeDecodeError:
+            continue
+        candidate = root / repository_path
+        if (
+            candidate.is_symlink()
+            or not candidate.is_file()
+            or not is_within(candidate.resolve(), scan_root)
+            or is_excluded_path(candidate, root)
+        ):
+            continue
+        files.append(candidate)
+    return sorted(files)
+
+
+def discover_files(root: Path, scan_root: Path) -> list[Path]:
+    files = git_files(root, scan_root)
+    return files if files is not None else walk_files(root, scan_root)
 
 
 def read_text(path: Path, limit: int = 2_000_000) -> str:
@@ -351,6 +420,111 @@ def dependency_names(package: dict) -> set[str]:
     return names
 
 
+def web_entry_evidence(target_root: Path, dependencies: set[str], package: dict) -> list[Path]:
+    candidates = [
+        target_root / "index.html",
+        target_root / "public" / "index.html",
+        *[
+            target_root / "src" / f"main{suffix}"
+            for suffix in (".js", ".jsx", ".ts", ".tsx", ".vue")
+        ],
+        *[
+            target_root / f"next.config{suffix}"
+            for suffix in (".js", ".mjs", ".ts")
+        ],
+        *[
+            target_root / f"nuxt.config{suffix}"
+            for suffix in (".js", ".ts")
+        ],
+        *[
+            target_root / f"svelte.config{suffix}"
+            for suffix in (".js", ".cjs", ".mjs")
+        ],
+        target_root / "angular.json",
+    ]
+    if "electron" in dependencies and isinstance(package.get("main"), str):
+        candidates.append(target_root / package["main"])
+    evidence = [path for path in candidates if path.is_file()]
+    for directory in ("app", "pages"):
+        candidate = target_root / directory
+        if candidate.is_dir() and any(
+            path.is_file()
+            and path.suffix.lower() in {".js", ".jsx", ".ts", ".tsx", ".vue", ".svelte"}
+            for path in candidate.rglob("*")
+        ):
+            evidence.append(candidate)
+    return evidence
+
+
+def react_native_entry_evidence(target_root: Path) -> list[Path]:
+    names = (
+        "index.js",
+        "index.jsx",
+        "index.ts",
+        "index.tsx",
+        "app.json",
+        "app.config.js",
+        "app.config.ts",
+    )
+    return [target_root / name for name in names if (target_root / name).is_file()]
+
+
+def android_application_build_files(target_root: Path) -> list[Path]:
+    application_patterns = (
+        r"\bcom\.android\.application\b",
+        r"\balias\s*\(\s*libs\.plugins\.[A-Za-z0-9_.]*android[A-Za-z0-9_.]*application\s*\)",
+    )
+    result: list[Path] = []
+    for name in ("build.gradle", "build.gradle.kts"):
+        build_file = target_root / name
+        if not build_file.is_file():
+            continue
+        text = read_text(build_file)
+        if any(
+            re.search(pattern, text, flags=re.IGNORECASE)
+            for pattern in application_patterns
+        ):
+            result.append(build_file)
+    return result
+
+
+def xcode_application_target_names(project_text: str) -> list[str]:
+    names: list[str] = []
+    for block in re.findall(
+        r"/\* Begin PBXNativeTarget section \*/(.*?)/\* End PBXNativeTarget section \*/",
+        project_text,
+        flags=re.DOTALL,
+    ):
+        for target in re.findall(
+            r"\bisa\s*=\s*PBXNativeTarget\s*;(.*?)(?=\n\s*};)",
+            block,
+            flags=re.DOTALL,
+        ):
+            if "com.apple.product-type.application" not in target:
+                continue
+            match = re.search(r"\bname\s*=\s*(?:\"([^\"]+)\"|([^;]+))\s*;", target)
+            if match:
+                names.append((match.group(1) or match.group(2)).strip())
+    return sorted(set(names))
+
+
+def slot_fragment(value: str) -> str:
+    return re.sub(r"[^A-Za-z0-9._-]+", "-", value).strip("-").lower() or "app"
+
+
+def apple_target_slot(target_name: str, variants: list[str]) -> str:
+    lowered = target_name.lower()
+    if "tvos" in variants and ("tv" in lowered or "television" in lowered):
+        variant = "tvos"
+    elif "macos" in variants and ("mac" in lowered or "desktop" in lowered):
+        variant = "macos"
+    elif "ios" in variants:
+        variant = "ios"
+    else:
+        variant = variants[0]
+    return f"{variant}-{slot_fragment(target_name)}"
+
+
 def relative(path: Path, root: Path) -> str:
     value = path.relative_to(root).as_posix()
     return value or "."
@@ -388,9 +562,21 @@ def uniapp_variants(manifest: Path) -> list[str]:
     return variants or ["android", "ios"]
 
 
-def detect(root: Path) -> dict:
+def detect(root: Path, scope: Path | None = None) -> dict:
     root = root.resolve()
-    files = walk_files(root)
+    git_top_level = git_value(root, "rev-parse", "--show-toplevel")
+    if git_top_level is not None and Path(git_top_level).resolve() != root:
+        raise ValueError(
+            "repository must point to the Git worktree root; use --scope for a subdirectory"
+        )
+    scan_root = (
+        (scope if scope.is_absolute() else root / scope).resolve()
+        if scope is not None
+        else root
+    )
+    if not scan_root.is_dir() or not is_within(scan_root, root):
+        raise ValueError("scope must be an existing directory inside the repository")
+    files = discover_files(root, scan_root)
     by_name: dict[str, list[Path]] = {}
     for path in files:
         by_name.setdefault(path.name, []).append(path)
@@ -428,17 +614,24 @@ def detect(root: Path) -> dict:
 
         if "react-native" in dependencies:
             variants = [name for name in ("android", "ios") if (target_root / name).exists()]
+            entry_evidence = react_native_entry_evidence(target_root)
+            expo_configured = "expo" in dependencies and bool(entry_evidence)
+            if not entry_evidence or (not variants and not expo_configured):
+                warnings.append(
+                    f"{relative(target_root, root)}: React Native dependency has no deployable entry/native platform evidence"
+                )
+                continue
             if not variants:
                 variants = ["android", "ios"]
-                warnings.append(
-                    f"{relative(target_root, root)}: React Native platforms inferred as android+ios; confirm build targets"
-                )
             add(
                 "react-native",
                 target_root,
                 variants=variants,
-                evidence=[manifest],
+                evidence=[manifest, *entry_evidence],
                 app_id_slots=variants,
+                confidence="medium" if expo_configured and not any(
+                    (target_root / name).exists() for name in ("android", "ios")
+                ) else "high",
             )
             continue
 
@@ -461,17 +654,43 @@ def detect(root: Path) -> dict:
             continue
 
         if dependencies & MINIAPP_DEPENDENCIES:
+            miniapp_evidence = [
+                target_root / name
+                for name in (
+                    "project.config.json",
+                    "app.json",
+                    "app.js",
+                    "app.ts",
+                    "src/app.config.js",
+                    "src/app.config.ts",
+                    "src/app.js",
+                    "src/app.ts",
+                    "src/app.tsx",
+                )
+                if (target_root / name).is_file()
+            ]
+            if not miniapp_evidence:
+                warnings.append(
+                    f"{relative(target_root, root)}: MiniApp dependency has no application lifecycle evidence"
+                )
+                continue
             add(
                 "miniapp",
                 target_root,
                 variants=["framework"],
-                evidence=[manifest],
+                evidence=[manifest, *miniapp_evidence],
                 app_id_slots=["miniapp"],
                 confidence="medium",
             )
             continue
 
         if dependencies & WEB_DEPENDENCIES:
+            entry_evidence = web_entry_evidence(target_root, dependencies, package)
+            if not entry_evidence:
+                warnings.append(
+                    f"{relative(target_root, root)}: web dependencies found without a deployable web entry"
+                )
+                continue
             variants = ["browser"]
             if "electron" in dependencies:
                 variants = ["electron"]
@@ -481,10 +700,26 @@ def detect(root: Path) -> dict:
                 "web",
                 target_root,
                 variants=variants,
-                evidence=[manifest],
+                evidence=[manifest, *entry_evidence],
                 app_id_slots=["web"],
                 confidence="medium" if dependencies == {"vite"} else "high",
             )
+
+    # Static/vanilla Web targets may not have a package manifest.
+    for entrypoint in by_name.get("index.html", []):
+        target_root = (
+            entrypoint.parent.parent
+            if entrypoint.parent.name == "public"
+            else entrypoint.parent
+        )
+        add(
+            "web",
+            target_root,
+            variants=["browser"],
+            evidence=[entrypoint],
+            app_id_slots=["web"],
+            confidence="medium" if not (target_root / "package.json").is_file() else "high",
+        )
 
     # HBuilderX UniApp projects may not have package.json.
     for manifest in by_name.get("manifest.json", []):
@@ -512,13 +747,38 @@ def detect(root: Path) -> dict:
             continue
         target_root = manifest.parent
         variants = [name for name in ("android", "ios", "web") if (target_root / name).exists()]
+        entrypoint = target_root / "lib" / "main.dart"
+        if not entrypoint.is_file() or not variants:
+            warnings.append(
+                f"{relative(target_root, root)}: Flutter package lacks lib/main.dart or a deployable platform directory"
+            )
+            continue
         slots = [name for name in variants if name in {"android", "ios", "web"}]
-        add("flutter", target_root, variants=variants, evidence=[manifest], app_id_slots=slots)
+        add(
+            "flutter",
+            target_root,
+            variants=variants,
+            evidence=[manifest, entrypoint],
+            app_id_slots=slots,
+        )
 
     # HarmonyOS targets.
     for manifest in by_name.get("build-profile.json5", []):
         target_root = manifest.parent
-        evidence = [manifest]
+        profile_text = read_text(manifest)
+        ability_evidence = [
+            path
+            for path in files
+            if is_within(path, target_root)
+            and "entryability" in path.as_posix().lower()
+            and path.suffix.lower() in {".ets", ".ts"}
+        ]
+        if not ability_evidence and not re.search(r"\bproducts?\b", profile_text):
+            warnings.append(
+                f"{relative(target_root, root)}: HarmonyOS profile has no application product or Ability entry evidence"
+            )
+            continue
+        evidence = [manifest, *ability_evidence]
         oh_package = target_root / "oh-package.json5"
         if oh_package.is_file():
             evidence.append(oh_package)
@@ -567,7 +827,7 @@ def detect(root: Path) -> dict:
             target_root = manifest.parents[2]
         else:
             target_root = manifest.parent
-        build_files = [target_root / name for name in ("build.gradle", "build.gradle.kts") if (target_root / name).is_file()]
+        build_files = android_application_build_files(target_root)
         if build_files:
             add(
                 "android",
@@ -575,6 +835,10 @@ def detect(root: Path) -> dict:
                 variants=["android"],
                 evidence=[manifest, *build_files],
                 app_id_slots=["android"],
+            )
+        elif any((target_root / name).is_file() for name in ("build.gradle", "build.gradle.kts")):
+            warnings.append(
+                f"{relative(target_root, root)}: Android manifest belongs to a non-application module"
             )
 
     # Apple application projects.
@@ -591,12 +855,22 @@ def detect(root: Path) -> dict:
             variants.append("macos")
         if not variants:
             variants = ["apple"]
+        application_targets = xcode_application_target_names(project_text)
+        app_id_slots = variants
+        if len(application_targets) > 1:
+            app_id_slots = [
+                apple_target_slot(target_name, variants)
+                for target_name in application_targets
+            ]
+            warnings.append(
+                f"{relative(project_file.parent.parent, root)}: Xcode project has multiple application targets; target-specific Application IDs are required"
+            )
         add(
             "apple",
             project_file.parent.parent,
             variants=variants,
             evidence=[project_file],
-            app_id_slots=variants,
+            app_id_slots=app_id_slots,
             confidence="medium",
         )
 
@@ -619,7 +893,7 @@ def detect(root: Path) -> dict:
     filtered: list[Candidate] = []
     for candidate in candidates.values():
         owned = False
-        if candidate.platform in {"android", "apple", "cpp"}:
+        if candidate.platform in {"android", "apple", "cpp", "web"}:
             for hybrid_root in hybrid_roots:
                 if candidate.root != hybrid_root and is_within(candidate.root, hybrid_root):
                     owned = True
@@ -681,11 +955,12 @@ def detect(root: Path) -> dict:
         if target["confidence"] == "low":
             warnings.append(f"{target['id']}: low-confidence candidate requires manual confirmation")
 
-    dirty = git_value(root, "status", "--short")
+    dirty = git_value(root, "status", "--short", "--", ".")
     return {
         "schema_version": 1,
         "repository": {
             "root": str(root),
+            "scan_scope": relative(scan_root, root),
             "git_commit": git_value(root, "rev-parse", "HEAD"),
             "dirty_paths": dirty.splitlines() if dirty else [],
         },
@@ -697,6 +972,11 @@ def detect(root: Path) -> dict:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("repository", nargs="?", default=".", type=Path)
+    parser.add_argument(
+        "--scope",
+        type=Path,
+        help="Limit detection to an existing repository-relative subdirectory",
+    )
     parser.add_argument("--output", type=Path, help="Write JSON to this path instead of stdout")
     parser.add_argument("--pretty", action="store_true", help="Pretty-print JSON")
     arguments = parser.parse_args()
@@ -704,7 +984,10 @@ def main() -> int:
     if not arguments.repository.is_dir():
         parser.error(f"repository is not a directory: {arguments.repository}")
 
-    result = detect(arguments.repository)
+    try:
+        result = detect(arguments.repository, arguments.scope)
+    except ValueError as error:
+        parser.error(str(error))
     text = json.dumps(result, ensure_ascii=False, indent=2 if arguments.pretty else None, sort_keys=True) + "\n"
     if arguments.output:
         arguments.output.parent.mkdir(parents=True, exist_ok=True)
