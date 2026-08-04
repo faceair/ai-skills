@@ -1,0 +1,29 @@
+# Apple adapter
+
+Official current access guide: https://docs.guance.com/real-user-monitoring/ios/app-access/
+Legacy macOS route to verify when applicable: https://docs.guance.com/real-user-monitoring/macos/app-access/
+Official source: https://github.com/GuanceCloud/datakit-ios
+
+## Detect
+
+Confirm independently shipped iOS, tvOS, or macOS targets from Xcode project/workspace settings, `Package.swift`, Info.plist/build settings, schemes, application/scene lifecycle, and archive configuration. Do not treat Pods, DerivedData, generated projects, or wrapper-owned iOS subprojects as independent applications.
+
+Inspect existing `FTMobileSDK`, SPM/Carthage/CocoaPods wiring, App/Scene delegate initialization, URLSession instrumentation, WebView bridge, Widget Extension setup, Replay, and dSYM tasks.
+
+## Plan
+
+Route iOS, tvOS, and macOS through the capability set documented for the selected SDK version; the documentation navigation may consolidate Apple platforms while older macOS pages remain accessible. Record which current page/release proves support for the actual target.
+
+Verify SPM, CocoaPods, or Carthage compatibility and preserve the repository's package manager. Map receiver and Application ID with the current SDK configuration API. Initialize once at the earliest supported application lifecycle point, with extension processes handled separately when documented.
+
+Avoid duplicate URLSession/WebView instrumentation when a framework wrapper or native SDK already owns it.
+
+## Privacy and artifacts
+
+Review platform privacy manifests/permissions and official data-sanitization hooks. Do not collect input/control text, request bodies, raw URL queries, or broad user dictionaries.
+
+Generate dSYM from the same archive/build and verify UUIDs before planning upload. Keep upload credentials out of scripts/project files and do not upload without authorization.
+
+## Validation
+
+Build/test the selected scheme and platform. Verify initialization count, Application ID per target/configuration, lifecycle views, URLSession behavior, trace allowlist, WebView ownership, crash/error symbol identity, extension behavior, and privacy canaries.
