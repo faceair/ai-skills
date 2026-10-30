@@ -226,9 +226,10 @@ by hand against `references/performance.md`:
 - Does the query scan a large volume of data that may trigger **sampling**? On log-type namespaces, high-volume
   scans return estimates indicated by `sample < 1.0` in the response envelope — see *Sampling* in that file and
   disclose this in delivery notes. (Metric queries are never sampled; over-large queries are rejected instead.)
-- Is the filter on the **field you discovered**? A regex or `search()` over the `message` body reads the whole
-  body column; the equivalent condition on a structured field (`ClientIP`, `ClientRequestPath`, `status`)
-  measured 0.001 GB against 0.312 GB on the same two rows. Use the field whenever one exists.
+- Is the filter on the **structured field you discovered**? A condition on a dedicated physical or variant
+  column prunes by block index or columnar skip list; matching against `message` via regex or `search()` forces
+  decompression and linear scanning of the unbounded raw payload column across the whole range. Use the field
+  whenever one exists, and keep full-text scanning solely for unstructured free text.
 
 Three shapes mean the caller's own state is being overridden, so they are defects even when the DQL builds:
 

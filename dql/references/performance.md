@@ -19,6 +19,35 @@ Every query falls into one of two shapes:
 The query text alone does not tell you which shape you got; the shape of the clauses does. Each rule
 below gives the form to prefer and what the other form costs.
 
+## Query Optimization Hierarchy (Priority)
+
+When writing any DQL query, enforce optimizations in this strict order. Earlier layers eliminate orders of magnitude more I/O than later ones:
+
+```
+[Level 1: Partition & Range]  Namespace + Request Time Range (Prunes partition directories and block metadata)
+          ↓
+[Level 2: Clustered Columns]   Physical routing keys (`service`, `status`, `source`, `host`) (Skips entire block files via sparse index)
+          ↓
+[Level 3: Structured Fields]   Indexed scalar/variant fields (`ClientIP = '...'`, `status IN [...]`) (Columnar skip list / inverted seek)
+          ↓
+[Level 4: Text Pattern Match]  `search(field, '#"..."')` > `search(field, '...')` > `wildcard('prefix*')` > `re(...)`
+          ↓
+[Level 5: Raw Payload Scan]    Free-text match over `message` (Reads/decompresses full raw text; STRICT FALLBACK ONLY)
+          ↓
+[Level 6: Post-Aggregation]    `HAVING`, un-pushed arithmetic, non-time `ORDER BY` (Runs on compute layer after storage read)
+```
+
+| Priority | Layer | Recommended Form | Cost Mechanism | Hazard to Avoid |
+| --- | --- | --- | --- | --- |
+| **P0 (Mandatory)** | **Time & Partition** | Request `start_time`/`end_time` + `namespace` | Storage prunes partitions/blocks at metadata layer | Writing relative `[15m::]` or pinned index `L("idx")` (overrides request, reads wrong partition) |
+| **P1 (Highest Prune)** | **Clustered Dimensions** | `{ service = 'auth', status >= 500 }` | Sparse block-level index skips 90%+ of compressed blocks | Filtering solely on non-clustered fields when clustered keys are known |
+| **P2 (High Selectivity)** | **Structured Column Match** | `{ ClientIP = '1.2.3.4' }`, `{ path IN ['/a','/b'] }` | Columnar vector reads only target column; skip lists avoid row decode | Matching structured values inside `message` via regex |
+| **P3 (Text Matching)** | **Selective Keyword/Phrase** | `search(field, '#"exact phrase"')` or `search(field, 'kw')` | Token index seek; phrase mode enforces strict adjacent order | Unanchored regex `=~ '.*pattern.*'` over free text |
+| **P4 (Fallback Only)** | **Raw Payload Scan** | `search(message, 'unstructured text')` | Reads, decompresses, and tokenizes raw variable-length text payloads | Using `message` regex when structured attributes (`http.url`, `ip`) already exist |
+| **P5 (Compute Layer)** | **Post-Read Aggregation** | Projected aliases in `SORDER BY`, in-WHERE filtering | Post-storage processing; cannot reduce data read volume | `HAVING` on unaggregated columns, expression in `SORDER BY` |
+
+---
+
 ## Rules
 
 1. **Know where the time range comes from.** A query executed through a request inherits
@@ -114,12 +143,14 @@ below gives the form to prefer and what the other form costs.
     conditions decide its own cost, and a condition in the outer query does not reduce what the inner
     query reads. `SHIFT` runs the query twice — the current window and the shifted one — so it
     roughly doubles the cost. Keep both as cheap as possible.
-14. **Filter on the discovered field, not on the message body.** A regex or `search()` over `message`
-    reads the whole body column even when two rows match. Measured on the same result set: filtering
-    `message =~ …` + `search()` cost **0.312 GB**, the equivalent condition on the structured fields
-    (`ClientIP`, `ClientRequestPath`) **0.001 GB** — a 300× difference for identical output. When a field
-    for the condition exists (confirmed with `show_field(namespace=…, source=…)`), filter on it; the
-    body scan is the fallback for genuine full-text search, not for values you can compare.
+14. **Filter on structured fields, not on the raw message body.**
+    Conditions on dedicated physical columns or index-backed fields prune data blocks before reading rows.
+    In contrast, applying regular expressions or `search()` over the `message` column forces the engine to
+    decompress and scan large, variable-length text payloads line by line, resulting in orders-of-magnitude
+    greater I/O and memory overhead for identical matches.
+    Whenever a relevant field exists (discovered via `show_field(namespace=…, source=…)`), always filter on
+    that field. Free-text scanning over `message` should strictly be reserved for queries where the target
+    information is not extracted into structured attributes.
 15. **Filter on clustered dimensions whenever possible.**
     Data blocks are physically clustered by primary routing keys. Common default clustered
     dimensions include:
